@@ -39,10 +39,10 @@ Notes
 - No external dependencies.
 
 """
+from __future__ import annotations
+
 from dt.policy.rl_stub import RLPolicy
 RL = RLPolicy(persist_path="sim/rl_state.json")
-
-from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
