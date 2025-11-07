@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-docker/launch_fabric.py — spin up lightweight containers that mirror nodes/*.yaml
+fabric_docker/launch_fabric.py — spin up lightweight containers that mirror nodes/*.yaml
 
 Usage
 -----
-python3 -m docker.launch_fabric \
+python3 -m fabric_docker.launch_fabric \
   --nodes nodes \
   --network fabric-net \
   --image alpine:3.20 \
@@ -200,7 +200,7 @@ def main():
     ap.add_argument("--prefix", default="fab-", help="Name prefix for containers")
     ap.add_argument("--tc", choices=["none", "container"], default="none", help="Traffic shaping mode")
     ap.add_argument("--force-arch", action="store_true", help="Ignore host vs node.arch mismatch")
-    ap.add_argument("--out", default="docker/containers.json", help="Write container mapping JSON here")
+    ap.add_argument("--out", default="fabric_docker/containers.json", help="Write container mapping JSON here")
     args = ap.parse_args()
 
     nodes_dir = Path(args.nodes)

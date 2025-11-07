@@ -108,7 +108,7 @@ chaos:
 # ---------- docker (optional) ----------
 # Requires: pip install docker, docker daemon running
 docker-launch:
-	$(ACT); $(PY) -m docker.launch_fabric --nodes $(NODES_DIR) --topology $(TOPO_FILE) --network fabric-net --image alpine:3.20 --prefix fab- --tc none
+	$(ACT); $(PY) -m fabric_docker.launch_fabric --nodes $(NODES_DIR) --topology $(TOPO_FILE) --network fabric-net --image alpine:3.20 --prefix fab- --tc none
 
 docker-clean:
 	@echo "Stopping & removing containers with label/prefix 'fab-' on network fabric-net…"
@@ -118,11 +118,11 @@ docker-clean:
 
 # ---------- dev hygiene ----------
 format:
-	$(ACT); black dt planner sim tools ui docker || true
-	$(ACT); isort dt planner sim tools ui docker || true
+	$(ACT); black dt planner sim tools ui fabric_docker || true
+	$(ACT); isort dt planner sim tools ui fabric_docker || true
 
 lint:
-	$(ACT); ruff check dt planner sim tools ui docker || true
+	$(ACT); ruff check dt planner sim tools ui fabric_docker || true
 
 clean:
 	@find . -name '__pycache__' -type d -prune -exec rm -rf {} +

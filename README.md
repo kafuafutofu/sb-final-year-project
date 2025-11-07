@@ -23,7 +23,7 @@ chaos engine so you can drive closed-loop simulations end-to-end.
 ## Prerequisites
 
 * Python 3.10 or newer
-* (Optional) Docker daemon if you want to experiment with `docker/launch_fabric.py`
+* (Optional) Docker daemon if you want to experiment with `fabric_docker/launch_fabric.py`
 
 ## Setup
 
