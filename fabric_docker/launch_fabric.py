@@ -267,16 +267,41 @@ def main():
     host_platform = PLATFORM_MAP.get(HOST_ARCH, f"linux/{HOST_ARCH}")
 
     for ns in node_specs:
-        if not args.force_arch and not host_supports(ns.arch):
-            skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)"))
+        target_platform = PLATFORM_MAP.get(ns.arch.lower())
+        host_can_run = host_supports(ns.arch)
+        needs_emulation = bool(target_platform) and target_platform != host_platform
+
+        platform_arg: Optional[str] = None
+
+        if host_can_run and not args.force_arch:
+            # Native execution – nothing special to do.
+            pass
+        elif target_platform:
+            platform_arg = target_platform
+            if needs_emulation and not binfmt_ready_for(platform_arg):
+                missing_binfmt.add(platform_arg)
+                skipped.append((
+                    ns.name,
+                    (
+                        "binfmt handler missing for "
+                        f"{platform_arg} (install via 'docker run --privileged --rm "
+                        "tonistiigi/binfmt --install all')"
+                    ),
+                ))
+                continue
+        else:
+            skipped.append((
+                ns.name,
+                f"arch mismatch host={HOST_ARCH} node={ns.arch} (no platform mapping)",
+            ))
             continue
 
-        target_platform = PLATFORM_MAP.get(ns.arch.lower())
-        platform_arg: Optional[str] = None
-        if args.force_arch and target_platform and target_platform != host_platform:
-            platform_arg = target_platform
-            if not binfmt_ready_for(platform_arg):
-                missing_binfmt.add(platform_arg)
+        if not host_can_run and platform_arg is None:
+            skipped.append((
+                ns.name,
+                f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)",
+            ))
+            continue
 
         spec = build_container_spec(ns, args.image, args.prefix, platform=platform_arg)
 
