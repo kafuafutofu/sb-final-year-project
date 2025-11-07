@@ -235,7 +235,7 @@ def main():
     created = []
     skipped = []
     for ns in node_specs:
-        if not args.force-arch and not host_supports(ns.arch):
+        if not args.force_arch and not host_supports(ns.arch):
             skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)"))
             continue
 
