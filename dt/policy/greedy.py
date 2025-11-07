@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dt.state import DTState, safe_float
-    from dt.cost_model import CostModel
+    from dt.cost_model import CostModel, merge_stage_details
 except Exception:  # pragma: no cover
     DTState = object  # type: ignore
     CostModel = object  # type: ignore
@@ -56,6 +56,8 @@ except Exception:  # pragma: no cover
             return float(x)
         except Exception:
             return d
+    def merge_stage_details(primary, cost):  # type: ignore
+        return (cost or []) or (primary or [])
 
 # Optional bandit
 try:
@@ -262,10 +264,11 @@ class GreedyPlanner:
 
         # End-to-end cost using CM (adds up compute+xfer & aggregates)
         job_cost = self.cm.job_cost(job, assignments)
+        merged_per_stage = merge_stage_details(per_stage, job_cost.get("per_stage") or [])
         out = {
             "job_id": job.get("id"),
             "assignments": assignments,
-            "per_stage": job_cost["per_stage"] if job_cost.get("per_stage") else per_stage,
+            "per_stage": merged_per_stage,
             "reservations": reservations,
             "latency_ms": job_cost.get("latency_ms", float("inf")),
             "energy_kj": job_cost.get("energy_kj", 0.0),

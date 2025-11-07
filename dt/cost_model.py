@@ -42,7 +42,7 @@ Adjust the constants in DEFAULTS or pass overrides into CostModel(..., **cfg).
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Set
 
 from math import isfinite
 
@@ -99,6 +99,50 @@ DEFAULTS = {
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def merge_stage_details(
+    primary: List[Dict[str, Any]] | None,
+    cost_entries: List[Dict[str, Any]] | None,
+) -> List[Dict[str, Any]]:
+    """Combine planner annotations with cost model metrics per stage.
+
+    ``primary`` typically contains rich metadata gathered during planning, such as
+    chosen formats, scores, reservation identifiers, and infeasibility reasons.
+    ``cost_entries`` is produced by :meth:`CostModel.job_cost` and carries the
+    authoritative compute/transfer/energy/risk measurements.
+
+    The helper preserves the ordering from ``cost_entries`` (which mirrors the
+    job's stages) while layering any additional keys from ``primary``.  Stages
+    present only in ``primary`` are appended afterwards so callers retain their
+    annotations even when the cost model skipped them (for instance, when
+    planning terminated early).
+    """
+
+    primary_list = list(primary or [])
+    cost_list = list(cost_entries or [])
+
+    if not primary_list and not cost_list:
+        return []
+
+    by_id = {st.get("id"): st for st in primary_list if st.get("id")}
+    merged: List[Dict[str, Any]] = []
+    seen: Set[Any] = set()
+
+    for entry in cost_list:
+        sid = entry.get("id")
+        if sid in by_id:
+            merged.append({**by_id[sid], **entry})
+            seen.add(sid)
+        else:
+            merged.append(dict(entry))
+
+    for st in primary_list:
+        sid = st.get("id")
+        if not sid or sid not in seen:
+            merged.append(dict(st))
+
+    return merged
 
 
 class CostModel:
