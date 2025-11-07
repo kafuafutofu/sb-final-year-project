@@ -153,6 +153,7 @@ class OverridesStore:
             self.state = {"links": {}, "nodes": {}}
 
     def _write(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.state, indent=2))
 
     def _post_dt(self, payload: Dict[str, Any], action: str):

@@ -1,21 +1,20 @@
-
----
-
-## `requirements.txt`
-
-```txt
-# Core
+# Core services
 Flask>=3.0
 PyYAML>=6.0.1
 requests>=2.32.0
-rich>=13.7
 
-# Optional (UI charts via CDN; no Python deps)
-# Optional Docker-based node emulation
+# Planner / validation helpers
+rich>=13.7.0
+jsonschema>=4.19.0
+
+# Analytics & export tooling
+numpy>=1.25.0
+pandas>=2.2.0
+
+# Optional extras (docker integration)
 docker>=7.0.0
 
-# Dev hygiene (optional but handy; used by Makefile targets)
+# Developer tools (optional but used by Makefile targets)
 black>=24.8.0
 isort>=5.13.2
 ruff>=0.6.0
-

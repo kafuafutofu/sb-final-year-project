@@ -18,7 +18,7 @@ Options
 -------
 --job PATH            YAML file containing a single job object or a list under 'jobs'
 --dry-run             Plan without reserving capacity (default: True)
---strategy STR        greedy (default) or cheapest-energy (local mode)
+--strategy STR        greedy (default) or cheapest-energy (local and remote)
 --remote URL          If provided, POSTs to {URL}/plan or {URL}/plan_batch
 --repeat N            Repeat planning N times (useful for Monte-Carlo learning with bandit; local mode)
 --out PATH            Save full JSON result(s) here
@@ -30,7 +30,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -111,12 +111,19 @@ def print_summary(results: List[Dict[str, Any]]):
         )
     console.print(tbl)  # type: ignore
 
-def plan_remote(base_url: str, jobs: List[Dict[str, Any]], dry_run: bool) -> List[Dict[str, Any]]:
+def plan_remote(
+    base_url: str,
+    jobs: List[Dict[str, Any]],
+    dry_run: bool,
+    strategy: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     import requests  # only needed in remote mode
     base = base_url.rstrip("/")
 
     if len(jobs) == 1:
         payload = {"job": jobs[0], "dry_run": dry_run}
+        if strategy:
+            payload["strategy"] = strategy
         r = requests.post(f"{base}/plan", json=payload, timeout=60)
         j = r.json()
         if not j.get("ok"):
@@ -124,6 +131,8 @@ def plan_remote(base_url: str, jobs: List[Dict[str, Any]], dry_run: bool) -> Lis
         return [j["data"]]
     else:
         payload = {"jobs": jobs, "dry_run": dry_run}
+        if strategy:
+            payload["strategy"] = strategy
         r = requests.post(f"{base}/plan_batch", json=payload, timeout=120)
         j = r.json()
         if not j.get("ok"):
@@ -167,7 +176,7 @@ def main():
     ap.add_argument("--job", required=True, help="Path to job YAML (single job, list of jobs, or {jobs: [...]})")
     ap.add_argument("--dry-run", action="store_true", help="Plan without reserving")
     ap.add_argument("--remote", default=None, help="Base URL of dt/api (e.g., http://127.0.0.1:8080)")
-    ap.add_argument("--strategy", default="greedy", choices=["greedy", "cheapest-energy"], help="Local-only: scoring preference")
+    ap.add_argument("--strategy", default="greedy", choices=["greedy", "cheapest-energy"], help="Scoring preference")
     ap.add_argument("--repeat", type=int, default=1, help="Local-only: repeat planning N times (bandit learning)")
     ap.add_argument("--out", default=None, help="Write JSON results to this path")
     args = ap.parse_args()
@@ -186,7 +195,7 @@ def main():
 
     try:
         if args.remote:
-            results = plan_remote(args.remote, jobs, dry_run=bool(args.dry_run))
+            results = plan_remote(args.remote, jobs, dry_run=bool(args.dry_run), strategy=args.strategy)
         else:
             results = plan_local(jobs, dry_run=bool(args.dry_run), strategy=args.strategy, repeat=args.repeat)
     except Exception as e:

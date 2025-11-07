@@ -45,7 +45,7 @@ help:
 	@echo "  plan             - plan $(JOBS_FILE) locally (dry-run)"
 	@echo "  demo             - send demo jobs (local); see vars NUM, WORKERS"
 	@echo "  montecarlo       - run Monte Carlo simulation"
-	@echo "  chaos            - apply chaos observations from $(TOPO_FILE)"
+        @echo "  chaos            - apply chaos schedule from $(TOPO_FILE) (SCENARIO=name)"
 	@echo "  docker-launch    - launch approx containers for nodes/"
 	@echo "  docker-clean     - stop & remove launched containers"
 	@echo "  format           - black/isort format"
@@ -103,7 +103,7 @@ montecarlo:
 	$(ACT); $(PY) -m sim.montecarlo --jobs $(JOBS_FILE) --trials $${TRIALS:-200} --out plans/montecarlo.json
 
 chaos:
-	$(ACT); $(PY) -m sim.chaos --topology $(TOPO_FILE) --apply
+        $(ACT); $(PY) -m sim.chaos --topology $(TOPO_FILE) $$( [ -z "$$SCENARIO" ] && echo "" || echo "--scenario $$SCENARIO" ) --run
 
 # ---------- docker (optional) ----------
 # Requires: pip install docker, docker daemon running
