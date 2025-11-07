@@ -28,13 +28,12 @@ Notes
 from __future__ import annotations
 import argparse
 import json
-import os
 import platform
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
@@ -52,6 +51,17 @@ ARCH_MAP = {
     "arm64": ["arm64", "aarch64"],
     "riscv64": ["riscv64"],
 }
+PLATFORM_MAP = {
+    "x86_64": "linux/amd64",
+    "amd64": "linux/amd64",
+    "aarch64": "linux/arm64",
+    "arm64": "linux/arm64",
+    "riscv64": "linux/riscv64",
+}
+BINFMT_ENTRY = {
+    "linux/arm64": ("qemu-aarch64", "qemu-arm"),
+    "linux/riscv64": ("qemu-riscv64",),
+}
 
 def load_yaml(p: Path) -> Any:
     with p.open("r", encoding="utf-8") as f:
@@ -67,6 +77,26 @@ def host_supports(arch: str) -> bool:
     a = arch.lower()
     host_list = ARCH_MAP.get(HOST_ARCH, [HOST_ARCH])
     return a in host_list
+
+
+def binfmt_ready_for(platform_tag: str) -> bool:
+    entries = BINFMT_ENTRY.get(platform_tag)
+    if not entries:
+        return True  # nothing special needed (either native or not tracked)
+    root = Path("/proc/sys/fs/binfmt_misc")
+    if not root.exists():
+        return False
+    for name in entries:
+        p = root / name
+        if not p.exists():
+            continue
+        try:
+            data = p.read_text(errors="ignore")
+        except Exception:
+            data = ""
+        if "enabled" in data:
+            return True
+    return False
 
 @dataclass
 class NodeSpec:
@@ -120,7 +150,9 @@ def ensure_network(client, name: str):
         return n
     return client.networks.create(name, driver="bridge", check_duplicate=True)
 
-def build_container_spec(ns: NodeSpec, image: str, prefix: str) -> Dict[str, Any]:
+def build_container_spec(
+    ns: NodeSpec, image: str, prefix: str, platform: Optional[str] = None
+) -> Dict[str, Any]:
     # CPU limits: use cpus -> docker param (requires daemon v20+), memory in bytes
     mem_bytes = int(max(1, ns.mem_gb) * (1024**3))
     labels = {
@@ -132,7 +164,7 @@ def build_container_spec(ns: NodeSpec, image: str, prefix: str) -> Dict[str, Any
     for k, v in ns.labels.items():
         labels[f"fabric.label.{k}"] = str(v)
 
-    return {
+    spec: Dict[str, Any] = {
         "name": f"{prefix}{ns.name}",
         "image": image,
         "detach": True,
@@ -151,6 +183,11 @@ def build_container_spec(ns: NodeSpec, image: str, prefix: str) -> Dict[str, Any
         "cap_add": ["NET_ADMIN"],  # needed if we do tc inside the container
         "command": ["sh", "-c", "sleep infinity"],
     }
+
+    if platform:
+        spec["platform"] = platform
+
+    return spec
 
 def ensure_image(client, image: str):
     try:
@@ -234,12 +271,43 @@ def main():
 
     created = []
     skipped = []
-    for ns in node_specs:
-        if not args.force-arch and not host_supports(ns.arch):
-            skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)"))
-            continue
+    missing_binfmt: Set[str] = set()
+    auto_emulated: Set[str] = set()
+    host_platform = PLATFORM_MAP.get(HOST_ARCH, f"linux/{HOST_ARCH}")
 
-        spec = build_container_spec(ns, args.image, args.prefix)
+    for ns in node_specs:
+        target_platform = PLATFORM_MAP.get(ns.arch.lower())
+        platform_arg: Optional[str] = None
+        host_has_native = host_supports(ns.arch)
+
+        if not host_has_native:
+            if not target_platform:
+                skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (no platform mapping available)"))
+                continue
+
+            platform_arg = target_platform
+            ready = binfmt_ready_for(platform_arg)
+            if not ready:
+                if args.force_arch:
+                    missing_binfmt.add(platform_arg)
+                else:
+                    skipped.append((
+                        ns.name,
+                        (
+                            f"arch mismatch host={HOST_ARCH} node={ns.arch} "
+                            "(binfmt handler missing; run `docker run --privileged --rm tonistiigi/binfmt --install all` "
+                            "and rerun with --force-arch)"
+                        ),
+                    ))
+                    continue
+            elif not args.force_arch:
+                auto_emulated.add(platform_arg)
+
+        elif args.force_arch and target_platform and target_platform != host_platform:
+            # Host already supports this arch; ignore platform forcing.
+            platform_arg = target_platform
+
+        spec = build_container_spec(ns, args.image, args.prefix, platform=platform_arg)
 
         # create or reuse
         cname = spec["name"]
@@ -253,7 +321,8 @@ def main():
         # connect to network if not connected
         try:
             net.reload()
-            attached_ids = [c["Name"].lstrip("/") for c in net.attrs.get("Containers") or {}.values()]
+            containers = (net.attrs.get("Containers") or {})
+            attached_ids = [c["Name"].lstrip("/") for c in containers.values()]
             if cname not in attached_ids:
                 net.connect(cont)
         except Exception as e:
@@ -262,7 +331,16 @@ def main():
         # start
         if cont.status != "running":
             print(f"[start] {cname}")
-            cont.start()
+            try:
+                cont.start()
+            except docker.errors.APIError as e:
+                skipped.append((ns.name, f"failed to start: {e.explanation or e}"))
+                try:
+                    cont.remove(force=True)
+                except Exception:
+                    pass
+                # don't treat as created entry
+                continue
             # give it a moment to get eth0
             time.sleep(0.3)
 
@@ -287,6 +365,7 @@ def main():
             "labels": ns.labels,
             "formats": ns.formats,
             "network": args.network,
+            "platform": platform_arg or host_platform,
         })
 
     # write mapping
@@ -298,6 +377,19 @@ def main():
     if skipped:
         for n, r in skipped:
             print(f" - {n}: {r}")
+        arch_skips = [1 for _, reason in skipped if "arch mismatch" in reason]
+        if arch_skips and not args.force_arch:
+            print("[hint] Rerun with --force-arch after installing binfmt handlers if you want to attempt cross-arch launches.")
+            print("       Install handlers with: docker run --privileged --rm tonistiigi/binfmt --install all")
+
+    if auto_emulated:
+        plats = ", ".join(sorted(auto_emulated))
+        print(f"[info] Host binfmt handlers detected; automatically emulating: {plats}.")
+
+    if missing_binfmt:
+        plats = ", ".join(sorted(missing_binfmt))
+        print(f"[hint] binfmt entries for {plats} were not detected on this host.")
+        print("       Install them with: docker run --privileged --rm tonistiigi/binfmt --install all")
     print(f"Map written → {outp}")
 
 if __name__ == "__main__":
