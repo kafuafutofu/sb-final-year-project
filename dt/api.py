@@ -24,13 +24,14 @@ python3 -m dt.api --host 0.0.0.0 --port 8080
 
 from __future__ import annotations
 import argparse
+import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
 from .state import DTState, safe_float
-from .cost_model import CostModel, clamp
+from .cost_model import CostModel, merge_stage_details
 
 # -----------------------------------
 # App singletons
@@ -215,6 +216,8 @@ def plan():
 
     # Compute end-to-end cost with current assignments
     cost = CM.job_cost(job, assignments)
+    cost_per_stage = cost.get("per_stage") or []
+    merged_per_stage = merge_stage_details(per_stage, cost_per_stage)
     ddl = safe_float(job.get("deadline_ms"), 0.0)
     penalty = CM.slo_penalty(ddl, cost["latency_ms"]) if ddl > 0 else 0.0
 
@@ -222,7 +225,7 @@ def plan():
         "job_id": job.get("id"),
         "assignments": assignments,
         "reservations": reservations,
-        "per_stage": cost["per_stage"],
+        "per_stage": merged_per_stage,
         "latency_ms": cost["latency_ms"],
         "energy_kj": cost["energy_kj"],
         "risk": cost["risk"],
@@ -260,8 +263,30 @@ def plan_batch():
         # Reuse the logic by faking a request-local plan
         tmp_req = {"job": j, "strategy": strategy, "dry_run": dry_run}
         with app.test_request_context(json=tmp_req):
-            _, resp = app.view_functions["plan"]()  # type: ignore
-            results.append(resp.json["data"])  # safe since we control it
+            plan_result = app.view_functions["plan"]()  # type: ignore
+            if isinstance(plan_result, tuple):
+                resp_obj, status = plan_result
+            else:
+                resp_obj = plan_result
+                status = getattr(resp_obj, "status_code", 200)
+
+            data = None
+            if hasattr(resp_obj, "get_json"):
+                data = resp_obj.get_json(silent=True)
+            if data is None:
+                try:
+                    data = json.loads(resp_obj.get_data(as_text=True) or "{}")
+                except Exception:
+                    data = {}
+
+            if status >= 400 or not data.get("ok", False):
+                return resp_obj, status
+
+            payload = data.get("data")
+            if payload is None:
+                return _err("plan returned no data", status=500)
+
+            results.append(payload)
     return _ok({"results": results})
 
 @app.post("/release")
