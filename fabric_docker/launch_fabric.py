@@ -9,6 +9,7 @@ python3 -m fabric_docker.launch_fabric \
   --nodes nodes \
   --network fabric-net \
   --image alpine:3.20 \
+  --image-arch arm64=alpine:3.20@sha256:... \
   --prefix fab- \
   --tc none \
   --force-arch   # (optional) force Docker platform to node.arch even if host supports it
@@ -17,6 +18,7 @@ Notes
 -----
 - Automatically attempts cross-architecture launches when binfmt handlers are present, and
   warns when emulation support is missing.
+- Supports per-architecture image overrides via repeated --image-arch ARCH=image options.
 - Only approximates CPU/mem limits. GPUs are *not* plumbed here (future work).
 - Traffic shaping:
     --tc none         : no shaping (default)
@@ -53,6 +55,11 @@ ARCH_MAP = {
     "arm64": ["arm64", "aarch64"],
     "riscv64": ["riscv64"],
 }
+ARCH_ALIASES: Dict[str, str] = {}
+for _canon, _aliases in ARCH_MAP.items():
+    ARCH_ALIASES[_canon] = _canon
+    for _alias in _aliases:
+        ARCH_ALIASES[_alias] = _canon
 PLATFORM_MAP = {
     "x86_64": "linux/amd64",
     "amd64": "linux/amd64",
@@ -79,6 +86,10 @@ def host_supports(arch: str) -> bool:
     a = arch.lower()
     host_list = ARCH_MAP.get(HOST_ARCH, [HOST_ARCH])
     return a in host_list
+
+
+def canonical_arch(arch: str) -> str:
+    return ARCH_ALIASES.get(arch.lower(), arch.lower())
 
 
 def binfmt_ready_for(platform_tag: str) -> bool:
@@ -181,14 +192,20 @@ def build_container_spec(
 
     return spec
 
-def ensure_image(client, image: str):
+def ensure_image(client, image: str, platform: Optional[str]):
     try:
         client.images.get(image)
-        return
+        if not platform or "@" in image:
+            return
     except docker.errors.ImageNotFound:
         pass
-    print(f"[pull] {image} ...")
-    client.images.pull(image)
+
+    pull_kwargs: Dict[str, Any] = {}
+    if platform and "@" not in image:
+        pull_kwargs["platform"] = platform
+    plat_note = f" ({platform})" if pull_kwargs.get("platform") else ""
+    print(f"[pull] {image}{plat_note} ...")
+    client.images.pull(image, **pull_kwargs)
 
 def install_tc_if_needed(client, container):
     # attempt Alpine detection, then install iproute2
@@ -226,6 +243,13 @@ def main():
     ap.add_argument("--topology", default="sim/topology.yaml", help="Topology YAML (for default egress shaping)")
     ap.add_argument("--network", default="fabric-net", help="Docker bridge network name")
     ap.add_argument("--image", default="alpine:3.20", help="Container image to run")
+    ap.add_argument(
+        "--image-arch",
+        action="append",
+        default=[],
+        metavar="ARCH=REF",
+        help="Override container image for specific node architectures (repeatable)",
+    )
     ap.add_argument("--prefix", default="fab-", help="Name prefix for containers")
     ap.add_argument("--tc", choices=["none", "container"], default="none", help="Traffic shaping mode")
     ap.add_argument("--force-arch", action="store_true", help="Ignore host vs node.arch mismatch")
@@ -247,9 +271,26 @@ def main():
 
     client = docker.from_env()
 
-    # ensure network & image
+    # ensure network
     net = ensure_network(client, args.network)
-    ensure_image(client, args.image)
+
+    image_overrides: Dict[str, str] = {}
+    for spec in args.image_arch:
+        if "=" not in spec:
+            print(f"error: invalid --image-arch '{spec}' (expected ARCH=REF)", file=sys.stderr)
+            sys.exit(2)
+        arch_key, ref = spec.split("=", 1)
+        arch_key = canonical_arch(arch_key)
+        ref = ref.strip()
+        if not ref:
+            print(f"error: --image-arch '{spec}' is missing an image reference", file=sys.stderr)
+            sys.exit(2)
+        image_overrides[arch_key] = ref
+
+    default_image = args.image.strip()
+    if not default_image:
+        print("error: --image must not be empty", file=sys.stderr)
+        sys.exit(2)
 
     # collect node specs
     node_specs: List[NodeSpec] = []
@@ -267,18 +308,53 @@ def main():
     host_platform = PLATFORM_MAP.get(HOST_ARCH, f"linux/{HOST_ARCH}")
 
     for ns in node_specs:
-        if not args.force_arch and not host_supports(ns.arch):
-            skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)"))
+        canon_arch = canonical_arch(ns.arch)
+        target_platform = PLATFORM_MAP.get(canon_arch)
+        host_can_run = host_supports(ns.arch)
+        needs_emulation = bool(target_platform) and target_platform != host_platform
+
+        platform_arg: Optional[str] = None
+
+        if host_can_run and not args.force_arch:
+            # Native execution – nothing special to do.
+            pass
+        elif target_platform:
+            platform_arg = target_platform
+            if needs_emulation and not binfmt_ready_for(platform_arg):
+                missing_binfmt.add(platform_arg)
+                skipped.append((
+                    ns.name,
+                    (
+                        "binfmt handler missing for "
+                        f"{platform_arg} (install via 'docker run --privileged --rm "
+                        "tonistiigi/binfmt --install all')"
+                    ),
+                ))
+                continue
+        else:
+            skipped.append((
+                ns.name,
+                f"arch mismatch host={HOST_ARCH} node={ns.arch} (no platform mapping)",
+            ))
             continue
 
-        target_platform = PLATFORM_MAP.get(ns.arch.lower())
-        platform_arg: Optional[str] = None
-        if args.force_arch and target_platform and target_platform != host_platform:
-            platform_arg = target_platform
-            if not binfmt_ready_for(platform_arg):
-                missing_binfmt.add(platform_arg)
+        if not host_can_run and platform_arg is None:
+            skipped.append((
+                ns.name,
+                f"arch mismatch host={HOST_ARCH} node={ns.arch} (use --force-arch to ignore)",
+            ))
+            continue
 
-        spec = build_container_spec(ns, args.image, args.prefix, platform=platform_arg)
+        image_ref = image_overrides.get(canon_arch, default_image)
+
+        try:
+            ensure_image(client, image_ref, platform_arg)
+        except docker.errors.DockerException as e:
+            err = getattr(e, "explanation", None) or str(e)
+            skipped.append((ns.name, f"failed to pull image {image_ref}: {err}"))
+            continue
+
+        spec = build_container_spec(ns, image_ref, args.prefix, platform=platform_arg)
 
         # create or reuse
         cname = spec["name"]
@@ -345,6 +421,7 @@ def main():
             "formats": ns.formats,
             "network": args.network,
             "platform": platform_arg or host_platform,
+            "image": image_ref,
         })
 
     # write mapping
