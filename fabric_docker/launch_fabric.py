@@ -11,10 +11,12 @@ python3 -m fabric_docker.launch_fabric \
   --image alpine:3.20 \
   --prefix fab- \
   --tc none \
-  --force-arch   # (optional) ignore node.arch mismatch with host
+  --force-arch   # (optional) force Docker platform to node.arch even if host supports it
 
 Notes
 -----
+- Automatically attempts cross-architecture launches when binfmt handlers are present, and
+  warns when emulation support is missing.
 - Only approximates CPU/mem limits. GPUs are *not* plumbed here (future work).
 - Traffic shaping:
     --tc none         : no shaping (default)
@@ -279,30 +281,24 @@ def main():
         target_platform = PLATFORM_MAP.get(ns.arch.lower())
         platform_arg: Optional[str] = None
         host_has_native = host_supports(ns.arch)
+        needs_emulation = not host_has_native
 
-        if not host_has_native:
+        if needs_emulation:
             if not target_platform:
                 skipped.append((ns.name, f"arch mismatch host={HOST_ARCH} node={ns.arch} (no platform mapping available)"))
                 continue
 
             platform_arg = target_platform
             ready = binfmt_ready_for(platform_arg)
-            if not ready:
-                if args.force_arch:
-                    missing_binfmt.add(platform_arg)
-                else:
-                    skipped.append((
-                        ns.name,
-                        (
-                            f"arch mismatch host={HOST_ARCH} node={ns.arch} "
-                            "(binfmt handler missing; run `docker run --privileged --rm tonistiigi/binfmt --install all` "
-                            "and rerun with --force-arch)"
-                        ),
-                    ))
-                    continue
-            elif not args.force_arch:
+            if ready:
                 auto_emulated.add(platform_arg)
-
+            else:
+                missing_binfmt.add(platform_arg)
+                print(
+                    "[binfmt] WARN: handler for"
+                    f" {platform_arg} not detected; attempting emulation anyway"
+                    " (install via `docker run --privileged --rm tonistiigi/binfmt --install all`)."
+                )
         elif args.force_arch and target_platform and target_platform != host_platform:
             # Host already supports this arch; ignore platform forcing.
             platform_arg = target_platform
@@ -316,8 +312,15 @@ def main():
             cont = c
             break
         if cont is None:
-            print(f"[create] {cname}")
-            cont = client.containers.create(**spec)
+            try:
+                print(f"[create] {cname}")
+                cont = client.containers.create(**spec)
+            except docker.errors.APIError as e:
+                err = e.explanation or str(e)
+                skipped.append((ns.name, f"failed to create on {platform_arg or host_platform}: {err}"))
+                if needs_emulation and platform_arg:
+                    missing_binfmt.add(platform_arg)
+                continue
         # connect to network if not connected
         try:
             net.reload()
@@ -334,7 +337,8 @@ def main():
             try:
                 cont.start()
             except docker.errors.APIError as e:
-                skipped.append((ns.name, f"failed to start: {e.explanation or e}"))
+                err = e.explanation or str(e)
+                skipped.append((ns.name, f"failed to start on {platform_arg or host_platform}: {err}"))
                 try:
                     cont.remove(force=True)
                 except Exception:
@@ -377,10 +381,6 @@ def main():
     if skipped:
         for n, r in skipped:
             print(f" - {n}: {r}")
-        arch_skips = [1 for _, reason in skipped if "arch mismatch" in reason]
-        if arch_skips and not args.force_arch:
-            print("[hint] Rerun with --force-arch after installing binfmt handlers if you want to attempt cross-arch launches.")
-            print("       Install handlers with: docker run --privileged --rm tonistiigi/binfmt --install all")
 
     if auto_emulated:
         plats = ", ".join(sorted(auto_emulated))
@@ -390,6 +390,7 @@ def main():
         plats = ", ".join(sorted(missing_binfmt))
         print(f"[hint] binfmt entries for {plats} were not detected on this host.")
         print("       Install them with: docker run --privileged --rm tonistiigi/binfmt --install all")
+        print("       Re-run the launcher afterwards; containers will start once emulation is available.")
     print(f"Map written → {outp}")
 
 if __name__ == "__main__":
