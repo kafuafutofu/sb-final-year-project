@@ -33,6 +33,7 @@ overrides_path   default: "sim/overrides.json" (optional)
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -66,6 +67,10 @@ def safe_int(x: Any, default: int = 0) -> int:
 
 def utc_ms() -> int:
     return int(time.time() * 1000)
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 # ----------------------------- data classes -----------------------------
@@ -358,10 +363,15 @@ class DTState:
                     "effective": self._effective_link(l),
                 })
 
+            federations, federation_links, node_federations = self._federation_overview_locked()
+
             return {
                 "ts": utc_ms(),
                 "nodes": nodes,
                 "links": links,
+                "federations": federations,
+                "federation_links": federation_links,
+                "node_federations": node_federations,
             }
 
     def get_node(self, name: str) -> Optional[Dict[str, Any]]:
@@ -400,10 +410,273 @@ class DTState:
                         self.links_by_key[k] = link
                     else:
                         return
-                dyn = link.setdefault("dyn", LinkDyn().__dict__.copy())
-                for kk, vv in changes.items():
-                    if kk in dyn:
-                        dyn[kk] = vv
+            dyn = link.setdefault("dyn", LinkDyn().__dict__.copy())
+            for kk, vv in changes.items():
+                if kk in dyn:
+                    dyn[kk] = vv
+
+    # -------- federation + planner helpers --------
+
+    def _derive_federation_name(self, node: Dict[str, Any]) -> str:
+        labels = node.get("labels") or {}
+        for key in ("federation", "zone", "site", "rack", "region"):
+            val = labels.get(key)
+            if isinstance(val, str) and val:
+                return val
+        return "global"
+
+    def _federation_overview_locked(
+        self,
+        nodes_view: Optional[Dict[str, Dict[str, Any]]] = None,
+        links_view: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]:
+        nodes_map = nodes_view if nodes_view is not None else self.nodes_by_name
+        links_map = links_view if links_view is not None else self.links_by_key
+
+        stats: Dict[str, Dict[str, Any]] = {}
+        node_to_fed: Dict[str, str] = {}
+
+        for name, node in nodes_map.items():
+            fed = self._derive_federation_name(node)
+            node_to_fed[name] = fed
+            entry = stats.setdefault(
+                fed,
+                {
+                    "name": fed,
+                    "nodes": [],
+                    "total_cpu_cores": 0.0,
+                    "free_cpu_cores": 0.0,
+                    "total_mem_gb": 0.0,
+                    "free_mem_gb": 0.0,
+                    "total_gpu_vram_gb": 0.0,
+                    "free_gpu_vram_gb": 0.0,
+                    "down_nodes": 0,
+                    "hot_nodes": 0,
+                    "reservations": 0,
+                    "trust_sum": 0.0,
+                    "trust_count": 0,
+                    "loss_sum": 0.0,
+                    "loss_count": 0,
+                },
+            )
+
+            entry["nodes"].append(name)
+
+            eff = self._effective_caps(node)
+            caps = node.get("caps", {})
+            dyn = node.get("dyn", {})
+            labels = node.get("labels", {})
+
+            entry["total_cpu_cores"] += safe_float(caps.get("max_cpu_cores"), 0.0)
+            entry["free_cpu_cores"] += safe_float(eff.get("free_cpu_cores"), 0.0)
+            entry["total_mem_gb"] += safe_float(caps.get("ram_gb"), 0.0)
+            entry["free_mem_gb"] += safe_float(eff.get("free_mem_gb"), 0.0)
+            entry["total_gpu_vram_gb"] += safe_float(caps.get("gpu_vram_gb"), 0.0)
+            entry["free_gpu_vram_gb"] += safe_float(eff.get("free_gpu_vram_gb"), 0.0)
+
+            if dyn.get("down"):
+                entry["down_nodes"] += 1
+            if safe_float(dyn.get("thermal_derate"), 0.0) >= 0.25:
+                entry["hot_nodes"] += 1
+
+            reservations = dyn.get("reservations") or {}
+            entry["reservations"] += len(reservations)
+
+            trust = labels.get("trust")
+            try:
+                if trust is not None:
+                    tval = float(trust)
+                    entry["trust_sum"] += tval
+                    entry["trust_count"] += 1
+            except Exception:
+                pass
+
+            loss_pct = safe_float((node.get("network") or {}).get("loss_pct"), None)
+            if loss_pct is not None:
+                entry["loss_sum"] += loss_pct
+                entry["loss_count"] += 1
+
+        federations: List[Dict[str, Any]] = []
+        for fed, entry in stats.items():
+            total_cpu = entry["total_cpu_cores"] or 0.0
+            free_cpu = entry["free_cpu_cores"] or 0.0
+            total_nodes = len(entry["nodes"])
+            trust_avg = (
+                entry["trust_sum"] / max(1, entry["trust_count"])
+                if entry["trust_count"]
+                else None
+            )
+            loss_avg = (
+                entry["loss_sum"] / max(1, entry["loss_count"])
+                if entry["loss_count"]
+                else None
+            )
+
+            federations.append(
+                {
+                    "name": fed,
+                    "nodes": list(entry["nodes"]),
+                    "total_cpu_cores": round(total_cpu, 4),
+                    "free_cpu_cores": round(free_cpu, 4),
+                    "total_mem_gb": round(entry["total_mem_gb"], 4),
+                    "free_mem_gb": round(entry["free_mem_gb"], 4),
+                    "total_gpu_vram_gb": round(entry["total_gpu_vram_gb"], 4),
+                    "free_gpu_vram_gb": round(entry["free_gpu_vram_gb"], 4),
+                    "down_nodes": entry["down_nodes"],
+                    "hot_nodes": entry["hot_nodes"],
+                    "reservations": entry["reservations"],
+                    "avg_trust": round(trust_avg, 4) if trust_avg is not None else None,
+                    "avg_loss_pct": round(loss_avg, 4) if loss_avg is not None else None,
+                    "load_factor": 0.0
+                    if total_cpu <= 0
+                    else clamp(
+                        (total_cpu - free_cpu) / max(1e-6, total_cpu), 0.0, 1.0
+                    ),
+                    "down_fraction": 0.0
+                    if total_nodes == 0
+                    else round(entry["down_nodes"] / total_nodes, 4),
+                    "hot_fraction": 0.0
+                    if total_nodes == 0
+                    else round(entry["hot_nodes"] / total_nodes, 4),
+                }
+            )
+
+        # Aggregate cross-federation link health (best effort)
+        link_buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for key, link in links_map.items():
+            a = link.get("a")
+            b = link.get("b")
+            if not a or not b:
+                continue
+            fa = node_to_fed.get(a, a)
+            fb = node_to_fed.get(b, b)
+            if fa == fb:
+                continue
+            pair = tuple(sorted((fa, fb)))
+            bucket = link_buckets.setdefault(
+                pair,
+                {
+                    "a": pair[0],
+                    "b": pair[1],
+                    "links": 0,
+                    "down": 0,
+                    "min_speed_gbps": float("inf"),
+                    "max_loss_pct": 0.0,
+                    "avg_rtt_ms_sum": 0.0,
+                },
+            )
+            eff = self._effective_link(link)
+            bucket["links"] += 1
+            if eff.get("down"):
+                bucket["down"] += 1
+            spd = safe_float(eff.get("speed_gbps"), float("inf"))
+            bucket["min_speed_gbps"] = min(bucket["min_speed_gbps"], spd)
+            bucket["max_loss_pct"] = max(
+                bucket["max_loss_pct"], safe_float(eff.get("loss_pct"), 0.0)
+            )
+            bucket["avg_rtt_ms_sum"] += safe_float(eff.get("rtt_ms"), 0.0)
+
+        federation_links: List[Dict[str, Any]] = []
+        for pair, bucket in link_buckets.items():
+            links_count = bucket["links"] or 1
+            min_speed = bucket["min_speed_gbps"]
+            if min_speed == float("inf"):
+                min_speed = None
+            federation_links.append(
+                {
+                    "a": bucket["a"],
+                    "b": bucket["b"],
+                    "links": bucket["links"],
+                    "down_links": bucket["down"],
+                    "min_speed_gbps": None if min_speed is None else round(min_speed, 4),
+                    "max_loss_pct": round(bucket["max_loss_pct"], 4),
+                    "avg_rtt_ms": round(bucket["avg_rtt_ms_sum"] / links_count, 4),
+                }
+            )
+
+        federations.sort(key=lambda x: x["name"])
+        federation_links.sort(key=lambda x: (x["a"], x["b"]))
+
+        return federations, federation_links, node_to_fed
+
+    def nodes_for_planner(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            out: Dict[str, Dict[str, Any]] = {}
+            for name, node in self.nodes_by_name.items():
+                cp = copy.deepcopy(node)
+                cp["effective"] = self._effective_caps(node)
+                out[name] = cp
+            return out
+
+    def federations_overview(self) -> Dict[str, Any]:
+        with self._lock:
+            federations, federation_links, node_federations = self._federation_overview_locked()
+            return {
+                "federations": federations,
+                "federation_links": federation_links,
+                "node_federations": node_federations,
+            }
+
+    def federation_stats(self) -> Dict[str, Any]:
+        return self.federations_overview()
+
+    def federation_for_node(self, node_name: str) -> Optional[str]:
+        with self._lock:
+            node = self.nodes_by_name.get(node_name)
+            if not node:
+                return None
+            return self._derive_federation_name(node)
+
+    def _effective_link_between_locked(self, a: str, b: str) -> Dict[str, Any]:
+        k = link_key(a, b)
+        link = self.links_by_key.get(k)
+        if link:
+            eff = self._effective_link(link)
+            eff["estimated"] = False
+            return eff
+
+        # Fallback estimation using node network hints and defaults
+        na = self.nodes_by_name.get(a)
+        nb = self.nodes_by_name.get(b)
+        netdef = self.defaults.get("network", {}) or {}
+
+        def _node_speed(node: Optional[Dict[str, Any]]) -> float:
+            if not node:
+                return safe_float(netdef.get("speed_gbps"), 1.0)
+            net = node.get("network") or {}
+            spd = safe_float(net.get("speed_gbps"), None)
+            if spd is None:
+                bw = safe_float(net.get("base_bandwidth_mbps"), 0.0)
+                if bw > 0:
+                    spd = bw / 1000.0
+            return spd if spd is not None else safe_float(netdef.get("speed_gbps"), 1.0)
+
+        eff_speed = min(_node_speed(na), _node_speed(nb))
+        eff_rtt = safe_float(netdef.get("rtt_ms"), 5.0)
+        eff_loss = safe_float(netdef.get("loss_pct"), 0.0)
+        eff_jitter = safe_float(netdef.get("jitter_ms"), 0.5)
+
+        if na:
+            eff_rtt = max(eff_rtt, safe_float((na.get("network") or {}).get("base_latency_ms"), eff_rtt))
+            eff_loss = max(eff_loss, safe_float((na.get("network") or {}).get("loss_pct"), eff_loss))
+        if nb:
+            eff_rtt = max(eff_rtt, safe_float((nb.get("network") or {}).get("base_latency_ms"), eff_rtt))
+            eff_loss = max(eff_loss, safe_float((nb.get("network") or {}).get("loss_pct"), eff_loss))
+
+        return {
+            "estimated": True,
+            "down": False,
+            "speed_gbps": eff_speed,
+            "rtt_ms": eff_rtt,
+            "jitter_ms": eff_jitter,
+            "loss_pct": eff_loss,
+        }
+
+    def effective_link_between(self, a: Optional[str], b: str) -> Dict[str, Any]:
+        if not a or a == b:
+            return {"estimated": True, "down": False, "speed_gbps": float("inf"), "rtt_ms": 0.0, "jitter_ms": 0.0, "loss_pct": 0.0}
+        with self._lock:
+            return self._effective_link_between_locked(a, b)
 
     # -------- reservations --------
 

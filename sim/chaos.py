@@ -37,10 +37,12 @@ except Exception:
 # ----------------------------- Config -----------------------------
 
 DEFAULT_OVERRIDES_PATH = Path(__file__).parent / "overrides.json"
+DEFAULT_NODES_DIR = Path(__file__).resolve().parent.parent / "nodes"
 
 # Event kinds we support and their allowed fields
 LINK_KINDS = {"link_degrade", "link_loss_spike", "link_down", "link_up"}
 NODE_KINDS = {"node_kill", "node_recover", "power_cap", "thermal_derate", "clock_skew", "packet_dup", "packet_reorder"}
+GROUP_KINDS = {"zone_blackout", "zone_recover", "federation_partition"}
 
 # ----------------------------- Helpers -----------------------------
 
@@ -65,6 +67,9 @@ class ChaosEvent:
     a: Optional[str] = None
     b: Optional[str] = None
     node: Optional[str] = None
+    label: Optional[str] = None
+    value: Optional[str] = None
+    value_b: Optional[str] = None
     # Link modifiers
     speed_gbps: Optional[float] = None
     rtt_ms: Optional[float] = None
@@ -110,8 +115,15 @@ def collect_chaos_events(topology: Dict[str, Any], scenario: Optional[str]) -> L
         at_s = float(e["at_s"])
         duration_s = float(e.get("duration_s", 0.0) or 0.0)
         ce = ChaosEvent(
-            at_s=at_s, kind=kind, duration_s=duration_s,
-            a=e.get("a"), b=e.get("b"), node=e.get("node"),
+            at_s=at_s,
+            kind=kind,
+            duration_s=duration_s,
+            a=e.get("a"),
+            b=e.get("b"),
+            node=e.get("node"),
+            label=e.get("label"),
+            value=e.get("value"),
+            value_b=e.get("value_b") or e.get("other"),
             speed_gbps=e.get("speed_gbps"),
             rtt_ms=e.get("rtt_ms"),
             jitter_ms=e.get("jitter_ms"),
@@ -125,19 +137,38 @@ def collect_chaos_events(topology: Dict[str, Any], scenario: Optional[str]) -> L
         )
         events.append(ce)
         # For bounded events, we inject an implicit "revert" marker
-        if ce.end_time() is not None and kind in (LINK_KINDS | NODE_KINDS):
+        if ce.end_time() is not None and kind in (LINK_KINDS | NODE_KINDS | GROUP_KINDS):
             # Add an internal revert event
             revert = ChaosEvent(
                 at_s=ce.end_time(),
                 kind=f"__revert__::{kind}",
                 duration_s=0.0,
-                a=ce.a, b=ce.b, node=ce.node
+                a=ce.a,
+                b=ce.b,
+                node=ce.node,
+                label=ce.label,
+                value=ce.value,
+                value_b=ce.value_b,
             )
             events.append(revert)
     events.sort()
     return events
 
 # ----------------------------- Overrides store -----------------------------
+
+
+def load_nodes_index(nodes_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Load node descriptors for label-based chaos events."""
+    index: Dict[str, Dict[str, Any]] = {}
+    try:
+        for path in sorted(Path(nodes_dir).glob("*.yaml")):
+            data = yaml.safe_load(path.read_text())
+            name = data.get("name")
+            if name:
+                index[name] = data
+    except Exception:
+        index = {}
+    return index
 
 class OverridesStore:
     """Backs overrides.json AND (optionally) posts to DT."""
@@ -211,11 +242,19 @@ class OverridesStore:
 # ----------------------------- Engine -----------------------------
 
 class ChaosEngine:
-    def __init__(self, store: OverridesStore, speed: float = 1.0, verbose: bool = True):
+    def __init__(
+        self,
+        store: OverridesStore,
+        speed: float = 1.0,
+        verbose: bool = True,
+        nodes_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self.store = store
         self.speed = max(0.01, speed)
         self.verbose = verbose
         self._stop = threading.Event()
+        self.nodes_index = nodes_index or {}
+        self.label_index = self._build_label_index()
 
     def stop(self):
         self._stop.set()
@@ -223,6 +262,110 @@ class ChaosEngine:
     def log(self, msg: str):
         if self.verbose:
             print(f"[chaos] {msg}")
+
+    # -------- label helpers --------
+
+    def _build_label_index(self) -> Dict[str, Dict[str, List[str]]]:
+        idx: Dict[str, Dict[str, List[str]]] = {}
+        for name, node in self.nodes_index.items():
+            labels = dict(node.get("labels") or {})
+            if "federation" not in labels:
+                for key in ("zone", "site", "region"):
+                    if labels.get(key):
+                        labels.setdefault("federation", labels[key])
+                        break
+            for key, val in labels.items():
+                if val is None:
+                    continue
+                sval = str(val)
+                bucket = idx.setdefault(key, {})
+                names = bucket.setdefault(sval, [])
+                names.append(name)
+        for val_map in idx.values():
+            for key in list(val_map.keys()):
+                val_map[key] = sorted(set(val_map[key]))
+        return idx
+
+    def _nodes_for(self, label: Optional[str], value: Optional[str]) -> List[str]:
+        if not label or value is None:
+            return []
+        label = str(label)
+        value = str(value)
+        return list(self.label_index.get(label, {}).get(value, []))
+
+    # -------- grouped actions --------
+
+    def _apply_zone_blackout(self, ev: ChaosEvent):
+        nodes = self._nodes_for(ev.label, ev.value)
+        if not nodes:
+            self.log(f"SKIP zone_blackout {ev.label}={ev.value}: no nodes")
+            return
+        for node in nodes:
+            self.store.node_apply(node, {"down": True})
+        self.log(f"ZONE BLACKOUT {ev.label}={ev.value} ({len(nodes)} nodes)")
+
+    def _apply_zone_recover(self, ev: ChaosEvent):
+        nodes = self._nodes_for(ev.label, ev.value)
+        if not nodes:
+            return
+        for node in nodes:
+            self.store.node_revert(node, ["down"])
+        self.log(f"ZONE RECOVER {ev.label}={ev.value} ({len(nodes)} nodes)")
+
+    def _apply_federation_partition(self, ev: ChaosEvent):
+        label = ev.label or "federation"
+        value_a = ev.value
+        value_b = ev.value_b
+        if value_a is None or value_b is None:
+            self.log("SKIP federation_partition: missing value")
+            return
+        group_a = self._nodes_for(label, value_a)
+        group_b = self._nodes_for(label, value_b)
+        if not group_a or not group_b:
+            self.log(
+                f"SKIP federation_partition {label}:{value_a}<->{value_b}: group missing"
+            )
+            return
+
+        fields: Dict[str, Any] = {}
+        if ev.speed_gbps is not None:
+            fields["speed_gbps"] = max(0.0, ev.speed_gbps)
+        if ev.rtt_ms is not None:
+            fields["rtt_ms"] = max(0.0, ev.rtt_ms)
+        if ev.jitter_ms is not None:
+            fields["jitter_ms"] = max(0.0, ev.jitter_ms)
+        if ev.loss_pct is not None:
+            fields["loss_pct"] = max(0.0, min(100.0, ev.loss_pct))
+        if not fields:
+            fields = {"loss_pct": 12.0, "rtt_ms": 35.0}
+
+        for a in group_a:
+            for b in group_b:
+                self.store.link_apply(a, b, dict(fields))
+
+        # Also expose federation level link for dashboards/DT state
+        self.store.link_apply(str(value_a), str(value_b), dict(fields))
+        self.log(
+            f"FEDERATION PARTITION {label}:{value_a}<->{value_b} ({len(group_a)*len(group_b)} pairs)"
+        )
+
+    def _revert_federation_partition(self, ev: ChaosEvent):
+        label = ev.label or "federation"
+        value_a = ev.value
+        value_b = ev.value_b
+        if value_a is None or value_b is None:
+            return
+        group_a = self._nodes_for(label, value_a)
+        group_b = self._nodes_for(label, value_b)
+        for a in group_a:
+            for b in group_b:
+                self.store.link_revert(
+                    a, b, ["speed_gbps", "rtt_ms", "jitter_ms", "loss_pct", "down"]
+                )
+        self.store.link_revert(
+            str(value_a), str(value_b), ["speed_gbps", "rtt_ms", "jitter_ms", "loss_pct", "down"]
+        )
+        self.log(f"FEDERATION HEAL {label}:{value_a}<->{value_b}")
 
     def apply_event(self, ev: ChaosEvent):
         k = ev.kind
@@ -297,6 +440,15 @@ class ChaosEngine:
                 self.log(f"PACKET REORDER {ev.node} -> p={pr}")
             return
 
+        if k in GROUP_KINDS:
+            if k == "zone_blackout":
+                self._apply_zone_blackout(ev)
+            elif k == "zone_recover":
+                self._apply_zone_recover(ev)
+            elif k == "federation_partition":
+                self._apply_federation_partition(ev)
+            return
+
         self.log(f"UNKNOWN EVENT KIND: {k}")
 
     def _revert_for(self, original_kind: str, ev: ChaosEvent):
@@ -340,6 +492,16 @@ class ChaosEngine:
                 pass
             return
 
+        if original_kind in GROUP_KINDS:
+            if original_kind == "zone_blackout":
+                self._apply_zone_recover(ev)
+            elif original_kind == "federation_partition":
+                self._revert_federation_partition(ev)
+            elif original_kind == "zone_recover":
+                # recover is typically one-shot
+                pass
+            return
+
     def run(self, schedule: List[ChaosEvent], start_time_s: float = 0.0):
         if not schedule:
             self.log("No chaos events to run.")
@@ -377,6 +539,7 @@ def build_argparser():
     ap.add_argument("--speed", type=float, default=1.0, help="Time acceleration factor (e.g., 20 for 20x)")
     ap.add_argument("--dt", type=str, default=None, help="DT observe endpoint (e.g., http://127.0.0.1:5055/observe)")
     ap.add_argument("--overrides", type=str, default=str(DEFAULT_OVERRIDES_PATH), help="Overrides JSON path")
+    ap.add_argument("--nodes", type=str, default=str(DEFAULT_NODES_DIR), help="Directory containing node descriptors")
     ap.add_argument("--dry-run", action="store_true", help="Only print schedule, do not run")
     ap.add_argument("--run", action="store_true", help="Execute schedule")
     return ap
@@ -389,6 +552,8 @@ def pretty_event(ev: ChaosEvent) -> str:
         base += f" link={ev.a}<->{ev.b}"
     if ev.node:
         base += f" node={ev.node}"
+    if ev.label and ev.value:
+        base += f" label={ev.label}:{ev.value}"
     return base
 
 def main():
@@ -406,7 +571,8 @@ def main():
             return
 
     store = OverridesStore(Path(args.overrides), dt_endpoint=args.dt)
-    engine = ChaosEngine(store, speed=args.speed, verbose=True)
+    nodes_idx = load_nodes_index(Path(args.nodes))
+    engine = ChaosEngine(store, speed=args.speed, verbose=True, nodes_index=nodes_idx)
 
     def handle_sig(sig, frame):
         engine.stop()
