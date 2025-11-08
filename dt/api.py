@@ -26,7 +26,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
@@ -37,8 +39,10 @@ from .cost_model import CostModel, merge_stage_details
 # App singletons
 # -----------------------------------
 
-STATE = DTState()              # loads nodes/, topology, starts watcher
-CM    = CostModel(STATE)
+STATE = DTState()  # loads nodes/, topology, starts watcher
+CM = CostModel(STATE)
+
+RECENT_PLANS: Deque[Dict[str, Any]] = deque(maxlen=200)
 
 app = Flask(__name__)
 
@@ -47,14 +51,18 @@ app = Flask(__name__)
 # Helpers
 # -----------------------------------
 
+
 def _ok(data: Any, status: int = 200):
     return jsonify({"ok": True, "data": data}), status
+
 
 def _err(msg: str, status: int = 400, **extra):
     return jsonify({"ok": False, "error": msg, **extra}), status
 
+
 def _free_caps(node: Dict[str, Any]) -> Dict[str, float]:
     return STATE._effective_caps(node)
+
 
 def _supports_formats(node: Dict[str, Any], stage: Dict[str, Any]) -> bool:
     allowed = set(stage.get("allowed_formats") or [])
@@ -66,23 +74,26 @@ def _supports_formats(node: Dict[str, Any], stage: Dict[str, Any]) -> bool:
         return True
     return bool(fmts & allowed)
 
+
 def _fits(node: Dict[str, Any], stage: Dict[str, Any]) -> bool:
     if (node.get("dyn") or {}).get("down", False):
         return False
     caps = _free_caps(node)
     res = stage.get("resources") or {}
-    need_cpu  = safe_float(res.get("cpu_cores"), 0.0)
-    need_mem  = safe_float(res.get("mem_gb"), 0.0)
+    need_cpu = safe_float(res.get("cpu_cores"), 0.0)
+    need_mem = safe_float(res.get("mem_gb"), 0.0)
     need_vram = safe_float(res.get("gpu_vram_gb"), 0.0)
-    if caps["free_cpu_cores"] + 1e-9 < need_cpu:  return False
-    if caps["free_mem_gb"]   + 1e-9 < need_mem:   return False
-    if caps["free_gpu_vram_gb"] + 1e-9 < need_vram: return False
+    if caps["free_cpu_cores"] + 1e-9 < need_cpu:
+        return False
+    if caps["free_mem_gb"] + 1e-9 < need_mem:
+        return False
+    if caps["free_gpu_vram_gb"] + 1e-9 < need_vram:
+        return False
     return _supports_formats(node, stage)
 
+
 def _choose_node_for_stage(
-    stage: Dict[str, Any],
-    prev_node: Optional[str],
-    strategy: str = "greedy"
+    stage: Dict[str, Any], prev_node: Optional[str], strategy: str = "greedy"
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Return (node_name, metrics). If infeasible, returns (None, {...}).
@@ -97,8 +108,14 @@ def _choose_node_for_stage(
 
         # Times & risk
         comp_ms = CM.compute_time_ms(stage, node)
-        xfer_ms = 0.0 if prev_node in (None, name) else CM.transfer_time_ms(prev_node, name, safe_float(stage.get("size_mb"), 10.0))
-        risk    = CM.risk_score(stage, node)
+        xfer_ms = (
+            0.0
+            if prev_node in (None, name)
+            else CM.transfer_time_ms(
+                prev_node, name, safe_float(stage.get("size_mb"), 10.0)
+            )
+        )
+        risk = CM.risk_score(stage, node)
 
         if strategy == "cheapest-energy":
             # Prefer nodes that minimize energy; tie-break with latency
@@ -122,6 +139,7 @@ def _choose_node_for_stage(
         return None, {"reason": "no_feasible_node"}
     return best_name, best_metrics
 
+
 def _reserve_stage(node_name: str, stage: Dict[str, Any]) -> Optional[str]:
     res = stage.get("resources") or {}
     req = {
@@ -132,17 +150,21 @@ def _reserve_stage(node_name: str, stage: Dict[str, Any]) -> Optional[str]:
     }
     return STATE.reserve(req)
 
+
 # -----------------------------------
 # Routes
 # -----------------------------------
+
 
 @app.get("/health")
 def health():
     return _ok({"ts": STATE.snapshot()["ts"]})
 
+
 @app.get("/snapshot")
 def snapshot():
     return _ok(STATE.snapshot())
+
 
 @app.post("/observe")
 def observe():
@@ -154,6 +176,7 @@ def observe():
         return _ok({"applied": True})
     except Exception as e:
         return _err(f"observe failed: {e}")
+
 
 @app.post("/plan")
 def plan():
@@ -204,13 +227,22 @@ def plan():
             res_id = _reserve_stage(chosen, st)
             if res_id is None:
                 # race or capacity changed; mark infeasible
-                per_stage.append({"id": sid, "node": chosen, "infeasible": True, "reason": "reservation_failed"})
+                per_stage.append(
+                    {
+                        "id": sid,
+                        "node": chosen,
+                        "infeasible": True,
+                        "reason": "reservation_failed",
+                    }
+                )
                 infeasible = True
                 prev_node = None
                 continue
             reservations.append({"node": chosen, "reservation_id": res_id})
 
-        per_stage.append({"id": sid, "node": chosen, "reservation_id": res_id, **metrics})
+        per_stage.append(
+            {"id": sid, "node": chosen, "reservation_id": res_id, **metrics}
+        )
         assignments[sid] = chosen
         prev_node = chosen
 
@@ -234,8 +266,16 @@ def plan():
         "infeasible": infeasible or (cost["latency_ms"] == float("inf")),
         "strategy": strategy,
         "dry_run": dry_run,
+        "ts": int(time.time() * 1000),
     }
+    RECENT_PLANS.appendleft(resp)
     return _ok(resp)
+
+
+@app.get("/plans")
+def plans():
+    return _ok(list(RECENT_PLANS))
+
 
 @app.post("/plan_batch")
 def plan_batch():
@@ -289,6 +329,7 @@ def plan_batch():
             results.append(payload)
     return _ok({"results": results})
 
+
 @app.post("/release")
 def release():
     """
@@ -302,7 +343,7 @@ def release():
     done = []
     for r in rels:
         node = r.get("node")
-        rid  = r.get("reservation_id")
+        rid = r.get("reservation_id")
         if node and rid:
             ok = STATE.release(node, rid)
             done.append({"node": node, "reservation_id": rid, "released": bool(ok)})
@@ -313,14 +354,17 @@ def release():
 # CLI entrypoint
 # -----------------------------------
 
+
 def main():
     ap = argparse.ArgumentParser(description="Fabric DT API")
     ap.add_argument("--host", default=os.environ.get("FABRIC_API_HOST", "127.0.0.1"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("FABRIC_API_PORT", "8080")))
+    ap.add_argument(
+        "--port", type=int, default=int(os.environ.get("FABRIC_API_PORT", "8080"))
+    )
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     app.run(host=args.host, port=args.port, debug=args.debug)
 
+
 if __name__ == "__main__":
     main()
-
