@@ -65,6 +65,12 @@ virtual environment for you.
    proxy snapshot, plan, and observe requests to the API and surface the live
    plan history collected on the server.
 
+   To point the dashboard at a remote API instance instead of its embedded
+   state, export `FABRIC_DT_REMOTE=http://127.0.0.1:8080` (or pass
+   `--remote http://127.0.0.1:8080` to `python -m ui.dashboard`). The UI will
+   proxy snapshot, plan, and observe requests to the API and surface the live
+   plan history collected on the server.
+
 3. **Submit workload plans**
    * Local greedy planner:
      ```bash
