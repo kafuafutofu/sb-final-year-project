@@ -50,7 +50,20 @@ virtual environment for you.
    make run-ui             # exposes http://127.0.0.1:8090
    ```
    The dashboard can submit demo jobs, inspect snapshots, and apply ad-hoc
-   observations to the running simulation.
+   observations to the running simulation. The “Fabric Topology” card renders a
+   live D3 map of nodes and links so you can watch reservations, thermal
+   derates, and chaos-induced failures propagate in real time. When launched via
+   `make run-ui` it now points at the API from step 1 (`http://127.0.0.1:8080`)
+   by default so the UI reflects real reservations and chaos events. To fall
+   back to the dashboard's embedded state, explicitly run
+   `FABRIC_DT_REMOTE= python -m ui.dashboard` (note the empty value before the
+   command).
+
+   To point the dashboard at a remote API instance instead of its embedded
+   state, export `FABRIC_DT_REMOTE=http://127.0.0.1:8080` (or pass
+   `--remote http://127.0.0.1:8080` to `python -m ui.dashboard`). The UI will
+   proxy snapshot, plan, and observe requests to the API and surface the live
+   plan history collected on the server.
 
    To point the dashboard at a remote API instance instead of its embedded
    state, export `FABRIC_DT_REMOTE=http://127.0.0.1:8080` (or pass
@@ -64,10 +77,16 @@ virtual environment for you.
      make plan                                 # dry-run plan for jobs/jobs_10.yaml
      python -m planner.run_plan --job jobs/jobs_10.yaml --dry-run
      ```
+     The dry-run variant never reserves capacity, so the dashboard snapshot
+     remains unchanged. Omit `--dry-run` (or run `make demo DRY=0`) when you
+     want to see the DT consume resources.
    * Remote planner talking to the API:
      ```bash
      python -m planner.run_plan --remote http://127.0.0.1:8080 --job jobs/jobs_10.yaml --dry-run
+     python -m planner.run_plan --remote http://127.0.0.1:8080 --job jobs/jobs_10.yaml
      ```
+     The first example performs a dry run; the second commits reservations so
+     the topology view glows cyan around the nodes assigned to the job.
    * Fire randomized demo jobs (records JSON/CSV under `plans/`):
      ```bash
      make demo NUM=25 WORKERS=4 QPS=2.0

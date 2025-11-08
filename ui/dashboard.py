@@ -361,6 +361,19 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
 .stage-card .fmt { color: #8fbef6; font-size: 12px; margin-top: 4px; display: block; }
 .stage-card .metrics { font-size: 12px; color: var(--muted2); margin-top: 4px; }
 .stage-arrow { font-size: 18px; color: var(--muted2); }
+.topology-canvas { width: 100%; height: 420px; position: relative; }
+.topology-canvas svg { width: 100%; height: 100%; }
+.topology-legend { margin-top: 8px; font-size: 12px; color: var(--muted2); display: flex; gap: 12px; flex-wrap: wrap; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.legend-dot.up { background: #2ecc71; border: 1px solid #1e5d42; }
+.legend-dot.derate { background: #f1c40f; border: 1px solid #6e5a1a; }
+.legend-dot.down { background: #e74c3c; border: 1px solid #5e1b1b; }
+.legend-dot.assignment { border: 2px solid var(--accent); border-radius: 50%; width: 12px; height: 12px; }
+.legend-dot.lossy { background: #f39c12; border: 1px solid #925208; }
+.node-label { fill: #cfe7ff; font-size: 11px; pointer-events: none; text-anchor: middle; }
+.link { stroke: #243140; stroke-width: 1.8px; stroke-linecap: round; opacity: 0.8; }
+.node-core { stroke: #1a2533; stroke-width: 1.5px; }
+.node-ring { fill: none; stroke-width: 3px; opacity: 0.8; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
@@ -379,9 +392,24 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
       <div class="kpi">Nodes: <span id="k_nodes" class="v">—</span></div>
       <div class="kpi">Links: <span id="k_links" class="v">—</span></div>
       <div class="kpi">Last Snapshot: <span id="k_ts" class="v">—</span></div>
+      <div class="kpi">Down: <span id="k_down" class="v">—</span></div>
+      <div class="kpi">Reservations: <span id="k_resv" class="v">—</span></div>
+      <div class="kpi">CPU used: <span id="k_cpu" class="v">—</span></div>
       <button class="btn" onclick="refresh()">Refresh</button>
       <button class="btn good" onclick="runDemo(true)">Dry-run Demo</button>
       <button class="btn primary" onclick="runDemo(false)">Reserve Demo</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Fabric Topology</h2>
+    <div class="topology-canvas" id="topology_canvas"><div class="small">Loading topology…</div></div>
+    <div class="topology-legend">
+      <span><span class="legend-dot up"></span> healthy</span>
+      <span><span class="legend-dot derate"></span> thermal derate</span>
+      <span><span class="legend-dot down"></span> down</span>
+      <span><span class="legend-dot assignment"></span> latest plan assignment</span>
+      <span><span class="legend-dot lossy"></span> lossy / degraded link</span>
     </div>
   </div>
 
@@ -447,6 +475,7 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
       </div>
       <textarea id="jobJson" rows="14" placeholder='Paste your job JSON here...'></textarea>
       <div class="small">Your job should contain: <span class="mono">id</span>, optional <span class="mono">deadline_ms</span>, and <span class="mono">stages[]</span>.</div>
+      <div class="small">Uncheck “Dry run” to reserve capacity. Active reservations glow with a cyan halo on the topology map.</div>
     </div>
 
     <div class="card">
@@ -488,6 +517,8 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
 <script>
 let SNAP = null;
 let LAST_PLAN = null;
+let TOPO_SIM = null;
+let TOPO_RESIZE = null;
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts || {});
@@ -505,9 +536,31 @@ function tag(s) { return `<span class="tag">${s}</span>`; }
 
 function renderOverview() {
   if (!SNAP) return;
-  document.getElementById('k_nodes').textContent = SNAP.nodes.length;
-  document.getElementById('k_links').textContent = SNAP.links.length;
+  const nodes = SNAP.nodes || [];
+  const links = SNAP.links || [];
+  document.getElementById('k_nodes').textContent = nodes.length;
+  document.getElementById('k_links').textContent = links.length;
   document.getElementById('k_ts').textContent = ts(SNAP.ts);
+  const down = nodes.filter(n => (n.dyn||{}).down).length;
+  const reservations = nodes.reduce((acc, n) => {
+    const dyn = n.dyn || {};
+    const res = dyn.reservations ? Object.keys(dyn.reservations).length : 0;
+    return acc + res;
+  }, 0);
+  let usedCpu = 0;
+  let maxCpu = 0;
+  nodes.forEach(n => {
+    const eff = n.effective || {};
+    const maxC = Number(eff.max_cpu_cores || 0);
+    const free = Number(eff.free_cpu_cores || 0);
+    if (maxC > 0) {
+      usedCpu += Math.max(0, maxC - free);
+      maxCpu += maxC;
+    }
+  });
+  document.getElementById('k_down').textContent = down;
+  document.getElementById('k_resv').textContent = reservations;
+  document.getElementById('k_cpu').textContent = maxCpu > 0 ? fmtPct(usedCpu / maxCpu) : '—';
 }
 
 function renderNodes() {
@@ -566,6 +619,231 @@ function renderLinks() {
   });
 }
 
+function destroyTopology() {
+  if (TOPO_SIM) {
+    TOPO_SIM.stop();
+    TOPO_SIM = null;
+  }
+}
+
+function renderTopology() {
+  const wrap = document.getElementById('topology_canvas');
+  if (!wrap) return;
+  if (!SNAP || !SNAP.nodes || SNAP.nodes.length === 0) {
+    destroyTopology();
+    wrap.innerHTML = '<div class="small">No topology data yet.</div>';
+    return;
+  }
+
+  const assignments = new Map();
+  if (LAST_PLAN && Array.isArray(LAST_PLAN.per_stage)) {
+    LAST_PLAN.per_stage.forEach(stage => {
+      if (!stage || stage.infeasible || !stage.node) return;
+      const prev = assignments.get(stage.node) || {count: 0, stages: []};
+      prev.count += 1;
+      if (stage.id) prev.stages.push(stage.id);
+      assignments.set(stage.node, prev);
+    });
+  }
+
+  const nodes = SNAP.nodes.map(n => {
+    const eff = n.effective || {};
+    const dyn = n.dyn || {};
+    const maxCpu = Number(eff.max_cpu_cores || 0);
+    const freeCpu = Number(eff.free_cpu_cores || 0);
+    const maxMem = Number(eff.max_mem_gb || 0);
+    const freeMem = Number(eff.free_mem_gb || 0);
+    const res = dyn.reservations ? Object.keys(dyn.reservations).length : 0;
+    const assign = assignments.get(n.name);
+    return {
+      id: n.name,
+      arch: n.arch,
+      class: n.class,
+      labels: n.labels || {},
+      down: Boolean(dyn.down),
+      derate: Number(dyn.thermal_derate || 0),
+      cpuCap: maxCpu,
+      cpuUsed: Math.max(0, maxCpu - freeCpu),
+      memCap: maxMem,
+      memUsed: Math.max(0, maxMem - freeMem),
+      reservations: res,
+      assignCount: assign ? assign.count : 0,
+      assignStages: assign ? assign.stages : [],
+    };
+  });
+
+  const lookup = new Map(nodes.map(n => [n.id, n]));
+  const links = (SNAP.links || [])
+    .filter(l => lookup.has(l.a) && lookup.has(l.b))
+    .map(l => {
+      const eff = l.effective || {};
+      return {
+        source: l.a,
+        target: l.b,
+        down: Boolean(eff.down),
+        speed: Number(eff.speed_gbps || 0),
+        loss: Number(eff.loss_pct || 0),
+        rtt: Number(eff.rtt_ms || 0),
+        jitter: Number(eff.jitter_ms || 0),
+        key: l.key,
+      };
+    });
+
+  const width = wrap.clientWidth || 720;
+  const height = Math.max(360, Math.min(760, 180 + nodes.length * 14));
+  wrap.innerHTML = '';
+
+  const svg = d3
+    .select(wrap)
+    .append('svg')
+    .attr('viewBox', `0 0 ${width} ${height}`)
+    .attr('preserveAspectRatio', 'xMidYMid meet');
+
+  const g = svg.append('g');
+
+  const linkWidth = l => 1.5 + Math.log1p(Math.max(0.2, l.speed));
+  const linkColor = l => {
+    if (l.down) return '#e74c3c';
+    if (l.loss >= 2.0 || l.jitter >= 2.0) return '#f39c12';
+    return '#2c3f57';
+  };
+
+  const linkGroup = g.append('g').attr('class', 'links');
+  const link = linkGroup
+    .selectAll('line')
+    .data(links)
+    .enter()
+    .append('line')
+    .attr('class', 'link')
+    .attr('stroke', linkColor)
+    .attr('stroke-width', linkWidth);
+
+  link.append('title').text(l => {
+    const parts = [
+      `${l.source} ↔ ${l.target}`,
+      `speed: ${f(l.speed, 2)} Gbps`,
+      `rtt: ${f(l.rtt, 1)} ms`,
+      `loss: ${f(l.loss, 2)} %`,
+    ];
+    if (l.down) parts.push('status: DOWN');
+    return parts.join('\n');
+  });
+
+  const nodeRadius = d => {
+    const cpu = Math.max(0, d.cpuCap);
+    const mem = Math.max(0, d.memCap);
+    const cpuTerm = Math.log10(cpu + 1) * 10;
+    const memTerm = Math.log10(mem + 1) * 4;
+    return 12 + Math.min(22, cpuTerm + memTerm);
+  };
+
+  const nodeColor = d => {
+    if (d.down) return '#e74c3c';
+    if (d.derate > 0.01) return '#f1c40f';
+    const pct = d.cpuCap > 0 ? Math.min(1, d.cpuUsed / d.cpuCap) : 0;
+    return d3.interpolateBlues(0.3 + pct * 0.6);
+  };
+
+  const simulation = d3
+    .forceSimulation(nodes)
+    .force(
+      'link',
+      d3
+        .forceLink(links)
+        .id(d => d.id)
+        .distance(l => {
+          const base = 160;
+          const speed = Math.max(0.2, l.speed || 0.2);
+          return base / Math.sqrt(speed);
+        })
+        .strength(0.6)
+    )
+    .force('charge', d3.forceManyBody().strength(-260))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => nodeRadius(d) + 16));
+
+  const drag = sim => {
+    function dragstarted(event, d) {
+      if (!event.active) sim.alphaTarget(0.2).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+    function dragended(event, d) {
+      if (!event.active) sim.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+    return d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended);
+  };
+
+  const nodesGroup = g.append('g').attr('class', 'nodes');
+  const node = nodesGroup
+    .selectAll('g')
+    .data(nodes)
+    .enter()
+    .append('g')
+    .call(drag(simulation));
+
+  node
+    .append('circle')
+    .attr('class', 'node-ring')
+    .attr('r', d => nodeRadius(d) + 5)
+    .attr('stroke', d => (d.assignCount > 0 ? '#6fc1ff' : '#2ecc71'))
+    .attr('stroke-dasharray', d => (d.assignCount > 0 ? null : '6 4'))
+    .style('display', d => (d.assignCount > 0 || d.reservations > 0 ? 'block' : 'none'));
+
+  node
+    .append('circle')
+    .attr('class', 'node-core')
+    .attr('r', d => nodeRadius(d))
+    .attr('fill', nodeColor);
+
+  node
+    .append('text')
+    .attr('class', 'node-label')
+    .attr('dy', 4)
+    .text(d => d.id);
+
+  node.append('title').text(d => {
+    const status = d.down
+      ? 'status: DOWN'
+      : d.derate > 0.01
+      ? `thermal derate: ${fmtPct(Math.min(1, d.derate))}`
+      : 'status: healthy';
+    const res = `reservations: ${d.reservations}`;
+    const assign = d.assignCount
+      ? `latest plan stages: ${d.assignStages.join(', ')}`
+      : 'latest plan stages: none';
+    return [
+      d.id,
+      `${d.arch || '—'} ${d.class || ''}`.trim(),
+      status,
+      `cpu ${f(d.cpuUsed, 1)} / ${f(d.cpuCap, 1)} cores`,
+      `mem ${f(d.memUsed, 1)} / ${f(d.memCap, 1)} GB`,
+      res,
+      assign,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  });
+
+  simulation.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  destroyTopology();
+  TOPO_SIM = simulation;
+}
+
 function renderPlanGraph() {
   const wrap = document.getElementById('plan_graph');
   if (!wrap) return;
@@ -615,10 +893,12 @@ function renderPlans() {
       `);
     });
     renderPlanGraph();
+    renderTopology();
   }).catch(e => {
     tb.innerHTML = `<tr><td colspan="6" class="small">No plans yet.</td></tr>`;
     LAST_PLAN = null;
     renderPlanGraph();
+    renderTopology();
   });
 }
 
@@ -629,6 +909,7 @@ async function refresh() {
     renderOverview();
     renderNodes();
     renderLinks();
+    renderTopology();
     renderPlans();
   } catch (e) {
     console.error(e);
@@ -671,6 +952,13 @@ async function applyObs() {
     alert('Observation failed: '+e.message);
   }
 }
+
+window.addEventListener('resize', () => {
+  if (TOPO_RESIZE) clearTimeout(TOPO_RESIZE);
+  TOPO_RESIZE = setTimeout(() => {
+    renderTopology();
+  }, 200);
+});
 
 setInterval(refresh, 4000);
 window.addEventListener('load', refresh);

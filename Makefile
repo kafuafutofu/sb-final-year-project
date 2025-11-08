@@ -71,7 +71,13 @@ run-api:
 	$(ACT); FABRIC_API_HOST=$(API_HOST) FABRIC_API_PORT=$(API_PORT) $(PY) -m dt.api
 
 run-ui:
-	$(ACT); FABRIC_UI_HOST=$(UI_HOST) FABRIC_UI_PORT=$(UI_PORT) $(PY) -m ui.dashboard
+	$(ACT); \
+	if [ -z "$${FABRIC_DT_REMOTE+x}" ]; then \
+		REMOTE="http://$(API_HOST):$(API_PORT)"; \
+	else \
+		REMOTE="$${FABRIC_DT_REMOTE}"; \
+	fi; \
+	FABRIC_UI_HOST=$(UI_HOST) FABRIC_UI_PORT=$(UI_PORT) FABRIC_DT_REMOTE="$$REMOTE" $(PY) -m ui.dashboard
 
 # ---------- data generation / validation ----------
 gen-nodes:
