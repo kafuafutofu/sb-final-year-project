@@ -34,6 +34,7 @@ from flask import Flask, jsonify, request
 
 from .state import DTState, safe_float
 from .cost_model import CostModel, merge_stage_details
+from .policy.resilient import FederatedPlanner
 
 # -----------------------------------
 # App singletons
@@ -41,6 +42,7 @@ from .cost_model import CostModel, merge_stage_details
 
 STATE = DTState()  # loads nodes/, topology, starts watcher
 CM = CostModel(STATE)
+FED_PLANNER = FederatedPlanner(STATE, CM)
 
 RECENT_PLANS: Deque[Dict[str, Any]] = deque(maxlen=200)
 
@@ -196,8 +198,28 @@ def plan():
     if not job:
         return _err("missing 'job'")
 
-    strategy = (body.get("strategy") or "greedy").lower().strip()
+    strategy_raw = body.get("strategy") or "greedy"
+    strategy = strategy_raw.lower().strip()
     dry_run = bool(body.get("dry_run", False))
+
+    if strategy in {
+        "resilient",
+        "network-aware",
+        "federated",
+        "fault-tolerant",
+        "ft",
+        "failover",
+        "balanced",
+        "load-balance",
+        "load-balanced",
+    }:
+        planner_result = FED_PLANNER.plan_job(job, dry_run=dry_run, mode=strategy)
+        planner_result["strategy"] = strategy_raw
+        planner_result["dry_run"] = dry_run
+        planner_result.setdefault("deadline_ms", safe_float(job.get("deadline_ms"), 0.0) or None)
+        planner_result.setdefault("federation_summary", STATE.federations_overview())
+        RECENT_PLANS.appendleft(planner_result)
+        return _ok(planner_result)
 
     stages: List[Dict[str, Any]] = job.get("stages") or []
     if not stages:
@@ -264,10 +286,11 @@ def plan():
         "deadline_ms": ddl or None,
         "slo_penalty": penalty,
         "infeasible": infeasible or (cost["latency_ms"] == float("inf")),
-        "strategy": strategy,
+        "strategy": strategy_raw,
         "dry_run": dry_run,
         "ts": int(time.time() * 1000),
     }
+    resp["federation_summary"] = STATE.federations_overview()
     RECENT_PLANS.appendleft(resp)
     return _ok(resp)
 

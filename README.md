@@ -52,18 +52,14 @@ virtual environment for you.
    The dashboard can submit demo jobs, inspect snapshots, and apply ad-hoc
    observations to the running simulation. The “Fabric Topology” card renders a
    live D3 map of nodes and links so you can watch reservations, thermal
-   derates, and chaos-induced failures propagate in real time. When launched via
-   `make run-ui` it now points at the API from step 1 (`http://127.0.0.1:8080`)
-   by default so the UI reflects real reservations and chaos events. To fall
-   back to the dashboard's embedded state, explicitly run
+   derates, and chaos-induced failures propagate in real time. Federation tables
+   summarise per-fabric load, down hosts, and cross-federation link health while
+   the plan history surfaces fallback coverage so you can spot weak failover
+   paths. When launched via `make run-ui` it now points at the API from step 1
+   (`http://127.0.0.1:8080`) by default so the UI reflects real reservations and
+   chaos events. To fall back to the dashboard's embedded state, explicitly run
    `FABRIC_DT_REMOTE= python -m ui.dashboard` (note the empty value before the
    command).
-
-   To point the dashboard at a remote API instance instead of its embedded
-   state, export `FABRIC_DT_REMOTE=http://127.0.0.1:8080` (or pass
-   `--remote http://127.0.0.1:8080` to `python -m ui.dashboard`). The UI will
-   proxy snapshot, plan, and observe requests to the API and surface the live
-   plan history collected on the server.
 
    To point the dashboard at a remote API instance instead of its embedded
    state, export `FABRIC_DT_REMOTE=http://127.0.0.1:8080` (or pass
@@ -91,15 +87,26 @@ virtual environment for you.
      ```bash
      make demo NUM=25 WORKERS=4 QPS=2.0
      ```
+   Planner strategies can be swapped at runtime via `--strategy`. In addition to
+   the original greedy and `cheapest-energy` modes, the CLI and dashboard expose
+   `resilient`, `network-aware`, `balanced`, and `federated` strategies powered
+   by `dt/policy/resilient.FederatedPlanner`. These compute fallback placements,
+   penalise saturated federations, and consider link loss/latency when
+   dispatching multi-stage jobs.
 
 4. **Inject chaos and observe feedback**
    ```bash
    make chaos                     # executes the schedule in sim/topology.yaml
    make chaos SCENARIO=link-fail  # choose a named scenario from topology.yaml
+   make chaos SCENARIO=campus_edge_failover
+   make chaos SCENARIO=multi_federation_surge
    ```
    The chaos engine writes overrides to `sim/overrides.json` (and optionally
-   posts them to `/observe`). The DT watcher thread merges the overrides into the
-   live state so subsequent plans reflect the new conditions.
+   posts them to `/observe`). Group events such as `zone_blackout` and
+   `federation_partition` will coordinate outages across sets of nodes or
+   federations so you can validate the federation-aware planner. The DT watcher
+   thread merges the overrides into the live state so subsequent plans reflect
+   the new conditions.
 
 5. **Analyse outcomes**
    * `sim/montecarlo.py` perturbs nodes/links and repeatedly plans jobs.
@@ -114,6 +121,9 @@ virtual environment for you.
   both the API and the planner.
 * `dt/policy/greedy.py` – baseline planner that scans feasible nodes, optionally
   collaborates with a bandit format selector, and performs reservations.
+* `dt/policy/resilient.py` – network- and federation-aware planner that scores
+  candidates for risk, load, link loss, and redundancy to emit primary and
+  fallback placements.
 * `planner/run_plan.py` – CLI wrapper that can call the local planner or a
   remote API, summarising results in the terminal.
 * `sim/chaos.py` – builds and executes chaos schedules against the DT by writing

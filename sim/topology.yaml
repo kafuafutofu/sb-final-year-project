@@ -173,6 +173,19 @@ chaos:
     at_s: 22
     duration_s: 5
     loss_pct: 2.5
+  - kind: zone_blackout
+    label: zone
+    value: lab
+    at_s: 34
+    duration_s: 18
+  - kind: federation_partition
+    label: zone
+    value: rackB
+    value_b: cloudlet
+    at_s: 52
+    duration_s: 28
+    loss_pct: 6.5
+    rtt_ms: 45
 
 scenarios:
   - name: wifi_brownout
@@ -204,4 +217,33 @@ scenarios:
       - { kind: link_down, a: site-lab, b: site-datacenter, at_s: 12, duration_s: 25 }
       - { kind: node_kill, node: srv-003, at_s: 18, duration_s: 12 }
       - { kind: link_degrade, a: site-hostel, b: site-datacenter, at_s: 14, duration_s: 30, speed_gbps: 5, rtt_ms: 3, jitter_ms: 1 }
+
+  - name: campus_edge_failover
+    description: "Edge zone blackout with cross-zone partition pushes workloads into lab and rackB federations."
+    apply:
+      placement_policies:
+        prefer_same_region: true
+        max_replication_factor: 3
+        prefer_low_co2: true
+      data_locality:
+        - { dataset: "images_raw", at: [site-lab, site-datacenter], size_gb: 120, cold_to_hot_ms: 500 }
+    chaos:
+      - { kind: zone_blackout, label: zone, value: edge, at_s: 6, duration_s: 26 }
+      - { kind: federation_partition, label: zone, value: lab, value_b: cloudlet, at_s: 14, duration_s: 34, loss_pct: 12.0, rtt_ms: 55 }
+      - { kind: thermal_derate, node: ws-025, at_s: 18, duration_s: 20, thermal_derate: 0.3 }
+      - { kind: zone_recover, label: zone, value: edge, at_s: 34 }
+
+  - name: multi_federation_surge
+    description: "Simultaneous rackB outage and cross-federation congestion to exercise planner failover."
+    apply:
+      placement_policies:
+        prefer_same_region: false
+        max_replication_factor: 3
+      link_overrides:
+        - { a: site-cloudlet, b: site-datacenter, speed_gbps: 0.4, rtt_ms: 20, loss_pct: 3.5 }
+    chaos:
+      - { kind: zone_blackout, label: zone, value: rackB, at_s: 4, duration_s: 40 }
+      - { kind: federation_partition, label: zone, value: home, value_b: cloudlet, at_s: 18, duration_s: 30, loss_pct: 18.0, rtt_ms: 70 }
+      - { kind: power_cap, node: srv-038, at_s: 8, duration_s: 25, power_cap_w: 160 }
+      - { kind: zone_recover, label: zone, value: rackB, at_s: 44 }
 
