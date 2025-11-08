@@ -29,12 +29,14 @@ import time
 from collections import deque
 from typing import Any, Dict, List, Optional
 
+import requests
 from flask import Flask, jsonify, request, make_response
 
 # --- DT imports ---
 from dt.state import DTState, safe_float
 from dt.cost_model import CostModel
 from dt.policy.greedy import GreedyPlanner
+
 try:
     from dt.policy.bandit import BanditPolicy
 except Exception:
@@ -42,53 +44,153 @@ except Exception:
 
 # ----------------- App singletons -----------------
 
-STATE = DTState()
-CM = CostModel(STATE)
-BANDIT = BanditPolicy(persist_path="sim/bandit_state.json") if BanditPolicy else None
-PLANNER = GreedyPlanner(STATE, CM, bandit=BANDIT, cfg={
-    "risk_weight": 10.0,
-    "energy_weight": 0.0,
-    "prefer_locality_bonus_ms": 0.5,
-    "require_format_match": False,
-})
-
 app = Flask(__name__)
+
+REMOTE_BASE = os.environ.get("FABRIC_DT_REMOTE")
+REMOTE_TIMEOUT = float(os.environ.get("FABRIC_DT_REMOTE_TIMEOUT", "10.0"))
+REMOTE_LABEL = "local DT (embedded)"
+SESSION = requests.Session()
+
+STATE: Optional[DTState] = None
+CM: Optional[CostModel] = None
+BANDIT = None
+PLANNER: Optional[GreedyPlanner] = None
+
 RECENT_PLANS: deque = deque(maxlen=50)
+
+
+def _configure_runtime(remote: Optional[str], timeout: float) -> None:
+    global STATE, CM, BANDIT, PLANNER, REMOTE_BASE, REMOTE_TIMEOUT, REMOTE_LABEL
+
+    REMOTE_BASE = remote.rstrip("/") if remote else None
+    REMOTE_TIMEOUT = timeout
+    REMOTE_LABEL = (
+        f"remote API @ {REMOTE_BASE}" if REMOTE_BASE else "local DT (embedded)"
+    )
+
+    if REMOTE_BASE:
+        STATE = None
+        CM = None
+        BANDIT = None
+        PLANNER = None
+    else:
+        if STATE is None:
+            STATE = DTState()
+            CM = CostModel(STATE)
+            BANDIT = (
+                BanditPolicy(persist_path="sim/bandit_state.json")
+                if BanditPolicy
+                else None
+            )
+            PLANNER = GreedyPlanner(
+                STATE,
+                CM,
+                bandit=BANDIT,
+                cfg={
+                    "risk_weight": 10.0,
+                    "energy_weight": 0.0,
+                    "prefer_locality_bonus_ms": 0.5,
+                    "require_format_match": False,
+                },
+            )
+
+
+_configure_runtime(REMOTE_BASE, REMOTE_TIMEOUT)
 
 
 # ----------------- Helpers -----------------
 
+
 def _ok(data: Any, status: int = 200):
     return jsonify({"ok": True, "data": data}), status
 
+
 def _err(msg: str, status: int = 400, **extra):
     return jsonify({"ok": False, "error": msg, **extra}), status
+
+
+def _remote_url(path: str) -> str:
+    if not REMOTE_BASE:
+        raise RuntimeError("remote base not configured")
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{REMOTE_BASE}{path}"
+
+
+def _proxy_remote(method: str, path: str, payload: Optional[Dict[str, Any]] = None):
+    if not REMOTE_BASE:
+        raise RuntimeError("remote base not configured")
+    try:
+        kwargs: Dict[str, Any] = {"timeout": REMOTE_TIMEOUT}
+        if payload is not None:
+            kwargs["json"] = payload
+        resp = SESSION.request(method.upper(), _remote_url(path), **kwargs)
+    except requests.RequestException as exc:
+        return _err(f"remote request failed: {exc}", status=502)
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return _err(
+            f"remote returned non-JSON response (status {resp.status_code})", status=502
+        )
+
+    return make_response(data, resp.status_code)
+
 
 def _demo_job() -> Dict[str, Any]:
     return {
         "id": f"demo-{int(time.time())}",
         "deadline_ms": 5000,
         "stages": [
-            {"id":"ingest","type":"io","size_mb":40,"resources":{"cpu_cores":1,"mem_gb":1},"allowed_formats":["native","wasm"]},
-            {"id":"prep","type":"preproc","size_mb":60,"resources":{"cpu_cores":2,"mem_gb":2},"allowed_formats":["native","cuda","wasm"]},
-            {"id":"mlp","type":"mlp","size_mb":100,"resources":{"cpu_cores":4,"mem_gb":4,"gpu_vram_gb":2},"allowed_formats":["cuda","native"]}
-        ]
+            {
+                "id": "ingest",
+                "type": "io",
+                "size_mb": 40,
+                "resources": {"cpu_cores": 1, "mem_gb": 1},
+                "allowed_formats": ["native", "wasm"],
+            },
+            {
+                "id": "prep",
+                "type": "preproc",
+                "size_mb": 60,
+                "resources": {"cpu_cores": 2, "mem_gb": 2},
+                "allowed_formats": ["native", "cuda", "wasm"],
+            },
+            {
+                "id": "mlp",
+                "type": "mlp",
+                "size_mb": 100,
+                "resources": {"cpu_cores": 4, "mem_gb": 4, "gpu_vram_gb": 2},
+                "allowed_formats": ["cuda", "native"],
+            },
+        ],
     }
 
 
 # ----------------- JSON APIs -----------------
 
+
 @app.get("/api/health")
 def api_health():
+    if REMOTE_BASE:
+        return _proxy_remote("GET", "/health")
     return _ok({"ts": STATE.snapshot()["ts"]})
+
 
 @app.get("/api/snapshot")
 def api_snapshot():
+    if REMOTE_BASE:
+        return _proxy_remote("GET", "/snapshot")
     return _ok(STATE.snapshot())
+
 
 @app.get("/api/plans")
 def api_plans():
+    if REMOTE_BASE:
+        return _proxy_remote("GET", "/plans")
     return _ok(list(RECENT_PLANS))
+
 
 @app.post("/api/plan")
 def api_plan():
@@ -107,6 +209,14 @@ def api_plan():
     if not job:
         return _err("missing 'job'")
     dry = bool(body.get("dry_run", True))
+    if REMOTE_BASE:
+        payload = {
+            "job": job,
+            "dry_run": dry,
+            "strategy": (body.get("strategy") or "greedy"),
+        }
+        return _proxy_remote("POST", "/plan", payload)
+
     res = PLANNER.plan_job(job, dry_run=dry)
     # SLO penalty if deadline
     ddl = safe_float(job.get("deadline_ms"), 0.0)
@@ -117,10 +227,19 @@ def api_plan():
     RECENT_PLANS.appendleft(res)
     return _ok(res)
 
+
 @app.post("/api/plan_demo")
 def api_plan_demo():
     job = _demo_job()
-    dry = bool((request.get_json() or {}).get("dry_run", True)) if request.is_json else True
+    dry = (
+        bool((request.get_json() or {}).get("dry_run", True))
+        if request.is_json
+        else True
+    )
+    if REMOTE_BASE:
+        payload = {"job": job, "dry_run": dry, "strategy": "greedy"}
+        return _proxy_remote("POST", "/plan", payload)
+
     res = PLANNER.plan_job(job, dry_run=dry)
     ddl = safe_float(job.get("deadline_ms"), 0.0)
     if ddl > 0:
@@ -129,6 +248,7 @@ def api_plan_demo():
     res["ts"] = int(time.time() * 1000)
     RECENT_PLANS.appendleft(res)
     return _ok(res)
+
 
 @app.post("/api/observe")
 def api_observe():
@@ -142,6 +262,9 @@ def api_observe():
         return _err("expected JSON body")
     try:
         payload = request.get_json()
+        if REMOTE_BASE:
+            return _proxy_remote("POST", "/observe", payload)
+
         STATE.apply_observation(payload)
         # Optionally persist overrides so state watcher picks them up across restarts
         try:
@@ -151,6 +274,7 @@ def api_observe():
         return _ok({"applied": True})
     except Exception as e:
         return _err(f"observe failed: {e}")
+
 
 # ----------------- HTML UI -----------------
 
@@ -228,6 +352,15 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
 .small { font-size: 12px; color: var(--muted2); }
 .right { text-align: right; }
 .flex { display: flex; gap: 8px; align-items: center; }
+.remote-label { color: var(--muted); margin-top: 4px; }
+.dag-wrap { margin-top: 12px; padding-top: 8px; border-top: 1px solid #1f2a39; }
+.dag-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.stage-card { background: var(--chip); border: 1px solid #2a3648; border-radius: 10px; padding: 10px 12px; min-width: 120px; }
+.stage-card.bad { background: #2a1414; border-color: #5e1b1b; }
+.stage-card .node { font-weight: 700; font-size: 14px; }
+.stage-card .fmt { color: #8fbef6; font-size: 12px; margin-top: 4px; display: block; }
+.stage-card .metrics { font-size: 12px; color: var(--muted2); margin-top: 4px; }
+.stage-arrow { font-size: 18px; color: var(--muted2); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
@@ -235,6 +368,7 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
 <body>
 <header>
   <h1>Fabric Digital Twin — <small>Cluster Dashboard</small></h1>
+  <div class="remote-label">Mode: __REMOTE_LABEL__</div>
 </header>
 
 <div class="container">
@@ -332,6 +466,7 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
           <tbody id="plans_tbody"></tbody>
         </table>
       </div>
+      <div class="dag-wrap" id="plan_graph"></div>
     </div>
 
   </div>
@@ -352,6 +487,7 @@ hr { border: none; border-top: 1px solid #1f2a39; margin: 12px 0; }
 
 <script>
 let SNAP = null;
+let LAST_PLAN = null;
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts || {});
@@ -430,10 +566,36 @@ function renderLinks() {
   });
 }
 
+function renderPlanGraph() {
+  const wrap = document.getElementById('plan_graph');
+  if (!wrap) return;
+  if (!LAST_PLAN) {
+    wrap.innerHTML = '<div class="small">No plans yet.</div>';
+    return;
+  }
+  const per = LAST_PLAN.per_stage || [];
+  if (!per.length) {
+    wrap.innerHTML = '<div class="small">Plan contains no stages.</div>';
+    return;
+  }
+  const parts = per.map(s => {
+    const node = s.node || '—';
+    const fmt = s.format ? `<span class="fmt">${s.format}</span>` : '';
+    const cls = s.infeasible ? 'stage-card bad' : 'stage-card';
+    const metrics = `<div class="metrics">c:${f(s.compute_ms,1)} ms • x:${f(s.xfer_ms,1)} ms</div>`;
+    const reason = s.infeasible && s.reason ? `<div class="small">${s.reason}</div>` : '';
+    const badgeHtml = s.infeasible ? `<div class="badge bad">Blocked</div>` : '';
+    return `<div class="${cls}"><div class="mono">${s.id||'?'}</div><div class="node">${node}</div>${fmt}${metrics}${badgeHtml}${reason}</div>`;
+  }).join('<div class="stage-arrow">→</div>');
+  wrap.innerHTML = `<div class="dag-row">${parts}</div>`;
+  wrap.insertAdjacentHTML('beforeend', `<div class="small" style="margin-top:6px;">Latency ${f(LAST_PLAN.latency_ms,1)} ms • Energy ${f(LAST_PLAN.energy_kj,3)} kJ • Risk ${f(LAST_PLAN.risk,3)}</div>`);
+}
+
 function renderPlans() {
   const tb = document.getElementById('plans_tbody');
   tb.innerHTML = '';
   fetchJSON('/api/plans').then(data => {
+    LAST_PLAN = data.length ? data[0] : null;
     data.forEach(p => {
       const stages = (p.per_stage||[]).map(s => {
         const nm = s.node || '—';
@@ -452,8 +614,11 @@ function renderPlans() {
         </tr>
       `);
     });
+    renderPlanGraph();
   }).catch(e => {
     tb.innerHTML = `<tr><td colspan="6" class="small">No plans yet.</td></tr>`;
+    LAST_PLAN = null;
+    renderPlanGraph();
   });
 }
 
@@ -515,23 +680,39 @@ window.addEventListener('load', refresh);
 </html>
 """
 
+
 @app.get("/")
 def index():
-    resp = make_response(_INDEX_HTML)
+    resp = make_response(_INDEX_HTML.replace("__REMOTE_LABEL__", REMOTE_LABEL))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
 
 
 # ----------------- CLI entry -----------------
 
+
 def main():
     ap = argparse.ArgumentParser(description="Fabric DT Dashboard")
     ap.add_argument("--host", default=os.environ.get("FABRIC_UI_HOST", "127.0.0.1"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("FABRIC_UI_PORT", "8090")))
+    ap.add_argument(
+        "--port", type=int, default=int(os.environ.get("FABRIC_UI_PORT", "8090"))
+    )
+    ap.add_argument(
+        "--remote", help="Remote Fabric DT API base URL (e.g. http://127.0.0.1:8080)"
+    )
+    ap.add_argument(
+        "--remote-timeout",
+        type=float,
+        default=REMOTE_TIMEOUT,
+        help="Timeout in seconds when contacting the remote API",
+    )
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
+    if args.remote is not None or args.remote_timeout != REMOTE_TIMEOUT:
+        target_remote = args.remote if args.remote is not None else REMOTE_BASE
+        _configure_runtime(target_remote, args.remote_timeout)
     app.run(host=args.host, port=args.port, debug=args.debug)
+
 
 if __name__ == "__main__":
     main()
-
