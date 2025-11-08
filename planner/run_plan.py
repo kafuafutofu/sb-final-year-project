@@ -80,7 +80,10 @@ def print_summary(results: List[Dict[str, Any]]):
     if not RICH:
         # Minimal stdout
         for r in results:
-            print(f"\nJob {r.get('job_id')}: latency={r.get('latency_ms')}ms  energy={r.get('energy_kj')}kJ  risk={r.get('risk')}  infeasible={r.get('infeasible')}")
+            feasible = not r.get("infeasible")
+            print(
+                f"\nJob {r.get('job_id')}: latency={r.get('latency_ms')}ms  energy={r.get('energy_kj')}kJ  risk={r.get('risk')}  feasible={feasible}"
+            )
             for s in (r.get("per_stage") or []):
                 print(f"  - {s.get('id')} → {s.get('node')}  fmt={s.get('format')}  c={s.get('compute_ms')}ms  x={s.get('xfer_ms')}ms  risk={s.get('risk')}")
         return
@@ -91,7 +94,7 @@ def print_summary(results: List[Dict[str, Any]]):
     tbl.add_column("Latency (ms)", justify="right")
     tbl.add_column("Energy (kJ)", justify="right")
     tbl.add_column("Risk", justify="right")
-    tbl.add_column("Infeasible", justify="center")
+    tbl.add_column("Feasible", justify="center")
     tbl.add_column("Stages", style="dim")
 
     for r in results:
