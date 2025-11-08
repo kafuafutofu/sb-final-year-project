@@ -29,9 +29,9 @@ TOPO_FILE ?= sim/topology.yaml
 
 # ---------- meta ----------
 .PHONY: help install venv deps freeze clean format lint \
-        run-api run-ui gen-nodes validate-nodes summarize-nodes export-csv \
-        plan demo montecarlo chaos \
-        docker-launch docker-clean
+	run-api run-ui gen-nodes validate-nodes summarize-nodes export-csv \
+	plan demo montecarlo chaos \
+	docker-launch docker-clean
 
 help:
 	@echo "Targets:"
@@ -45,7 +45,7 @@ help:
 	@echo "  plan             - plan $(JOBS_FILE) locally (dry-run)"
 	@echo "  demo             - send demo jobs (local); see vars NUM, WORKERS"
 	@echo "  montecarlo       - run Monte Carlo simulation"
-        @echo "  chaos            - apply chaos schedule from $(TOPO_FILE) (SCENARIO=name)"
+	@echo "  chaos            - apply chaos schedule from $(TOPO_FILE) (SCENARIO=name)"
 	@echo "  docker-launch    - launch approx containers for nodes/"
 	@echo "  docker-clean     - stop & remove launched containers"
 	@echo "  format           - black/isort format"
@@ -103,7 +103,7 @@ montecarlo:
 	$(ACT); $(PY) -m sim.montecarlo --jobs $(JOBS_FILE) --trials $${TRIALS:-200} --out plans/montecarlo.json
 
 chaos:
-        $(ACT); $(PY) -m sim.chaos --topology $(TOPO_FILE) $$( [ -z "$$SCENARIO" ] && echo "" || echo "--scenario $$SCENARIO" ) --run
+	$(ACT); $(PY) -m sim.chaos --topology $(TOPO_FILE) $$( [ -z "$$SCENARIO" ] && echo "" || echo "--scenario $$SCENARIO" ) --run
 
 # ---------- docker (optional) ----------
 # Requires: pip install docker, docker daemon running
